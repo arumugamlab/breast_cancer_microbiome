@@ -1,4 +1,4 @@
-# A. Differential Abundance Pipeline: DAA_function()
+# A. Differential Abundance Pipeline: `DAA_function()`
 
 **Purpose:** Multi-method differential abundance (DA) analysis of microbiome count/TPM data stored as `phyloseq` objects, with automatic consensus calling across methods.
 
