@@ -32,11 +32,11 @@ library(survminer)      # ggsurvplot()
 # ── 1. Load & prepare survival metadata ───────────────────────────────────────
 
 # Load the clinical data  to match participant IDs to DNA_IDs 
-clinical_data.filt<-readRDS("/projects/dk_breast_cancer-AUDIT/data/processed/metadata/Clean/Clinical_data.2026_updated.rds")
+clinical_data.filt<-readRDS("/Clinical_data.2026_updated.rds")
 row.names(clinical_data.filt)<-clinical_data.filt$DNA_ID
 
 # Load the survival data sheet and match participant IDs to DNA_IDs via lookup
-SurvivalAnalysis <- read_excel("/maps/projects/arumugam/people/xhf865/Camila/BreastCancer/data/SurvivalAnalysis.xlsx") %>% as.data.frame()
+SurvivalAnalysis <- read_excel("/SurvivalAnalysis.xlsx") %>% as.data.frame()
 
 # Map participant_id → DNA_ID using the clinical data reference table
 SurvivalAnalysis$DNA_ID <- lookup_e(
@@ -60,7 +60,7 @@ SurvivalAnalysis$last_lookup   <- as.Date(SurvivalAnalysis$date_lookup,   format
 
 # ── 2. Load & filter phyloseq (breast cancer, complete cases) ─────────────────
 
-ps.motus <- readRDS("/projects/arumugam/people/xhf865/Camila/BreastCancer/phyloseq/ps.motus_raw.3.0.3.rds")
+ps.motus <- readRDS("/ps.motus_raw.3.0.3.rds")
 
 # Subset to breast cancer samples only
 ps.motus <- prune_samples(
