@@ -65,15 +65,16 @@ Each element is a `phyloseq` object with:
 
 | Component | Required | Notes |
 |---|---|---|
-| `otu_table` | ✅ | Raw counts; features × samples orientation |
-| `sample_data` | ✅ | Must contain `variable_col`, all `covariates`, and `DNA_ID` |
+| `otu_table` | ✅ | Raw counts (Taxonomy) / TPM (Functional profiles); features × samples orientation |
+| `sample_data` | ✅ | Must contain `variable_col`,and all `covariates` |
 | `tax_table` | Optional | Used for annotation only |
 
 **Example:**
 ```r
 ps_list <- list(
-  Taxonomy = ps_16S,
-  Pathway  = ps_humann
+  Taxonomy      = ps_mOTUs,
+  KEGG_Pathway  = FA.KEGG_Pathway,
+  KEGG_KO       = FA.KEGG_KO 
 )
 ```
 
@@ -188,29 +189,6 @@ results <- run_da_pipeline(
 | `significant_all_methods.csv` | All significant features across datasets and methods |
 | `consensus_features.csv` | Cross-method consensus summary |
 
----
-
-## Extending the pipeline
-
-**Add a covariate:**
-```r
-covariates = c("Age", "bmi_calculated", "smoking_status")
-```
-
-**Add a random effect (longitudinal data):**
-```r
-random_effect = "PatientID"
-```
-
-**Change significance threshold:**
-```r
-alpha = 0.10
-```
-
-**Use Bonferroni correction:**
-```r
-p_adj_method = "bonferroni"
-```
 
 ---
 
