@@ -355,21 +355,4 @@ This script prints results to the console and renders one plot. No files are wri
 | `summary(cox_clr)` | console | Full Cox summary — CLR model |
 | `km_plot` | `print()` | Kaplan–Meier recurrence-free survival plot |
 
-### Kaplan–Meier colour scheme
-
-| Group | Hex | Meaning |
-|---|---|---|
-| Absent | `#264653` | Dark teal |
-| Present | `#9d0208` | Deep red |
-
----
-
-## Key variables
-
-| Variable | Description |
-|---|---|
-| `meta_mOTU_v3_12389` | mOTU identifier for the candidate *Sutterellaceae* species |
-| `prev_thresh` | Prevalence threshold (default `0.10`; change to adjust stringency) |
-| `pseudocount` | Half the minimum non-zero count; added before CLR to handle zeros |
-
 ---
