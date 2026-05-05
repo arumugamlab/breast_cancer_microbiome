@@ -195,3 +195,186 @@ results <- run_da_pipeline(
 ## Note
 
 - `log2FC` from LMM reflects the **CLR-scale regression coefficient** for the variable of interest, not a true log2 fold-change. Interpret accordingly when comparing across methods.
+
+
+# B. Sutterellaceae Relapse & Survival Analysis : `sutterellaceae_survival_analysis.R`
+
+**Author:** Camila Alvarez-Silva  
+
+---
+
+## Overview
+
+This script investigates the association between gut *Sutterellaceae* abundance (mOTU `meta_mOTU_v3_12389`) and breast cancer relapse using two complementary analytical frameworks:
+
+1. **Logistic regression** — odds ratios (OR) for relapse, using both binary (presence/absence) and continuous (CLR-transformed) abundance.
+2. **Survival analysis** — Cox proportional hazards models and a Kaplan–Meier curve for recurrence-free survival stratified by *Sutterellaceae* presence.
+
+---
+
+## Analysis workflow
+
+```
+Survival metadata (.xlsx)
+        +
+Clinical reference table (clinical_data.filt)
+        │
+        ▼
+  Matched cohort (DNA_ID, relapse, dates)
+        │
+        ▼
+phyloseq object (ps.motus_raw.3.0.3.rds)
+        │  subset → BreastCancer + complete cases
+        │  prevalence filter ≥ 10 %
+        ▼
+OTU matrix (samples × features)
+        │
+        ├─► Binary (presence/absence)
+        │         └─► Logistic regression (OR)
+        │         └─► Cox model 1
+        │         └─► Kaplan–Meier plot
+        │
+        └─► CLR-transformed abundance
+                  └─► Logistic regression (OR)
+                  └─► Cox model 2
+```
+
+---
+
+## Dependencies
+
+```r
+install.packages(c("readxl", "dplyr", "survival", "survminer"))
+BiocManager::install("phyloseq")
+install.packages("compositions")   # for clr()
+```
+
+---
+
+## Input files
+
+### 1. `/Survivaldata.xlsx`
+
+Excel spreadsheet with one row per participant.
+
+| Column | Type | Description |
+|---|---|---|
+| `participant_id` | character | Participant identifier (script prepends `"BC"`) |
+| `relapse` | integer | 1 = relapsed, 0 = censored |
+| `relapse_date` | date string | Date of relapse event (`YYYY-MM-DD`); `NA` if censored |
+| `enrolment` | date string | Study enrolment / baseline date (`YYYY-MM-DD`) |
+| `date_lookup` | date string | Last follow-up / censoring date (`YYYY-MM-DD`) |
+
+### 2. `clinical_data.filt` (R object, expected in environment)
+
+Reference table used to resolve `participant_id` → `DNA_ID`.
+
+| Column | Description |
+|---|---|
+| `participant_id` | Participant identifier |
+| `DNA_ID` | Sample identifier matching the phyloseq object |
+
+### 3. `ps.motus_raw.3.0.3.rds`
+
+A `phyloseq` object built from mOTUs v3.0.3.
+
+| Component | Required | Description |
+|---|---|---|
+| `otu_table` | ✅ | Raw mOTU counts; features × samples |
+| `sample_data` | ✅ | Must contain the columns listed below |
+| `tax_table` | Optional | Not used in this script |
+
+**Required `sample_data` columns:**
+
+| Column | Description |
+|---|---|
+| `DNA_ID` | Sample identifier; used as row name for alignment |
+| `DiseaseStatus` | Samples are filtered to `"BreastCancer"` |
+| `relapse` | Used to subset to patients with known relapse status |
+| `relapse.binary` | Numeric 0/1, outcome for logistic regression |
+| `bmi_calculated` | Body mass index (covariate) |
+| `ki67_ihc` | Ki-67 proliferation index (covariate) |
+| `ln_tumorpositive.binary` | Lymph-node positivity binary flag (covariate) |
+
+---
+
+## Sample & feature filtering
+
+| Step | Criterion | Rationale |
+|---|---|---|
+| Subset samples | `DiseaseStatus == "BreastCancer"` | Analysis restricted to BC patients |
+| Complete cases | Non-missing in `relapse`, `bmi_calculated`, `ki67_ihc`, `ln_tumorpositive.binary`| Ensures no missing covariates for models |
+| Prune zero taxa | `taxa_sums > 0` | Remove taxa absent after sample filtering |
+| Prevalence filter | Present in ≥ 10 % of remaining samples | Removes sparse features that inflate testing burden |
+
+---
+
+## Methods
+
+### Abundance representations
+
+| Representation | Construction | Used in |
+|---|---|---|
+| `Sutterellaceae_bin` | `count > 0` (TRUE/FALSE) | Logistic model 4a, Cox model 1, KM plot |
+| `Sutterellaceae` (CLR) | Half-minimum pseudocount → column-wise CLR via `compositions::clr` | Logistic model 4b, Cox model 2 |
+
+### Logistic regression (odds ratios)
+
+Both models use `glm(..., family = binomial)` with the same four covariates.
+
+```
+relapse.binary ~ Sutterellaceae[_bin] + ki67_ihc + bmi_calculated + ln_tumorpositive.binary
+```
+
+Results are exponentiated with `exp(cbind(OR = coef(), confint()))` to give ORs and 95 % CIs.
+
+### Survival analysis
+
+**Time-to-event:**
+
+```
+time = relapse_date − enrolment        (if relapse_event == 1)
+time = date_lookup  − enrolment        (if censored)
+```
+
+**Cox models** — identical covariate structure to logistic models, fitted with `coxph()`.
+
+**Kaplan–Meier** — `survfit()` stratified by `Sutterellaceae_bin`, plotted with `ggsurvplot()` including a log-rank p-value.
+
+---
+
+## Output
+
+This script prints results to the console and renders one plot. No files are written by default — add `write.csv()` / `ggsave()` calls as needed.
+
+| Output | Function | Description |
+|---|---|---|
+| `or_bin` | `print()` | OR table for binary *Sutterellaceae* model |
+| `or_clr` | `print()` | OR table for CLR *Sutterellaceae* model |
+| `summary(cox_bin)` | console | Full Cox summary — binary model |
+| `summary(cox_clr)` | console | Full Cox summary — CLR model |
+| `km_plot` | `print()` | Kaplan–Meier recurrence-free survival plot |
+
+### Kaplan–Meier colour scheme
+
+| Group | Hex | Meaning |
+|---|---|---|
+| Absent | `#264653` | Dark teal |
+| Present | `#9d0208` | Deep red |
+
+---
+
+## Key variables
+
+| Variable | Description |
+|---|---|
+| `meta_mOTU_v3_12389` | mOTU identifier for the candidate *Sutterellaceae* species |
+| `prev_thresh` | Prevalence threshold (default `0.10`; change to adjust stringency) |
+| `pseudocount` | Half the minimum non-zero count; added before CLR to handle zeros |
+
+---
+
+## Notes
+
+- Row alignment across `otu_mat`, `otu_clr`, `meta.df`, and `SurvivalAnalysis` is enforced with `stopifnot()` checks after every merge step.
+- `lookup_e()` is a project-internal helper function — it must be available in the environment before running this script.
