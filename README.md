@@ -65,8 +65,8 @@ Each element is a `phyloseq` object with:
 
 | Component | Required | Notes |
 |---|---|---|
-| `otu_table` | ✅ | Raw counts (Taxonomy) / TPM (Functional profiles); features × samples orientation |
-| `sample_data` | ✅ | Must contain `variable_col`,and all `covariates` |
+| `otu_table` | Required | Raw counts (Taxonomy) / TPM (Functional profiles); features × samples orientation |
+| `sample_data` | Required | Must contain `variable_col`,and all `covariates` |
 | `tax_table` | Optional | Used for annotation only |
 
 **Example:**
@@ -280,8 +280,8 @@ A `phyloseq` object built from mOTUs v3.0.3.
 
 | Component | Required | Description |
 |---|---|---|
-| `otu_table` | ✅ | Raw mOTU counts; features × samples |
-| `sample_data` | ✅ | Must contain the columns listed below |
+| `otu_table` | Required | Raw mOTU counts; features × samples |
+| `sample_data` | Required | Must contain the columns listed below |
 | `tax_table` | Optional | Not used in this script |
 
 **Required `sample_data` columns:**
@@ -373,8 +373,3 @@ This script prints results to the console and renders one plot. No files are wri
 | `pseudocount` | Half the minimum non-zero count; added before CLR to handle zeros |
 
 ---
-
-## Notes
-
-- Row alignment across `otu_mat`, `otu_clr`, `meta.df`, and `SurvivalAnalysis` is enforced with `stopifnot()` checks after every merge step.
-- `lookup_e()` is a project-internal helper function — it must be available in the environment before running this script.
