@@ -88,7 +88,7 @@ ps_list <- list(
 |---|---|---|---|
 | `ps_list` | named list | — | List of `phyloseq` objects (see above) |
 | `variable_col` | character | — | Primary variable of interest; must be a column in `sample_data` (e.g. `"DiseaseStatus"`, `"relapse"`) |
-| `covariates` | character vector | — | Adjustment covariates (e.g. `c("Age", "bmi_calculated")`). Included in all model formulae |
+| `covariates` | character vector | — | Adjustment covariates (e.g. `c("Age", "bmi")`). Included in all model formulae |
 | `random_effect` | character or NULL | `NULL` | Column name for random intercept in LMM (e.g. `"PatientID"` for repeated-measures). Pass `NULL` for standard LM |
 | `alpha` | numeric | `0.05` | Adjusted p-value significance threshold |
 | `p_adj_method` | character | `"fdr"` | Multiple-testing correction method passed to all methods (any value accepted by `p.adjust`) |
