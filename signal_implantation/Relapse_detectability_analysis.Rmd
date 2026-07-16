@@ -1,0 +1,939 @@
+---
+title: "Breast cancer microbiome recurrence signal implantation benchmark analysis using SIMBA"
+author:
+  - name: "Mani Arumugam"
+    affiliation: "University of Copenhagen"
+    email: "arumugam@sund.ku.dk"
+date: "Date last modified: 16-07-2026"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+vignette: >
+  %\VignetteIndexEntry{Breast cancer microbiome recurrence signal implantation benchmark analysis using SIMBA}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Overview
+
+This document is a step-by-step walkthrough for reproducing the breast cancer recurrence biomarker detectability and calibration analysis in the manuscript. The analysis starts from a single `phyloseq` object and proceeds through four main stages:
+
+1. prepare the count table and sample metadata;
+2. generate signal-implantation simulations with a patched version of SIMBA;
+3. benchmark multiple differential abundance methods on the simulated data; and
+4. compare the real-data results with simulation-derived detectability boundaries.
+
+The goal is not only to reproduce the figures in the manuscript, but also to make the logic of the workflow transparent to anyone who wants to rerun or adapt it to a comparable dataset.
+
+# Before you start
+
+## Required inputs
+
+To reproduce the analysis, you will need:
+
+- a `phyloseq` object containing the taxon count table and sample metadata;
+- installation of the patched SIMBA fork from https://github.com/microbiomix/SIMBA
+  - (use `devtools::install_github(repo="https://github.com/microbiomix/SIMBA")`)
+- the companion helper scripts `helper_functions.R`, `helper_detectability.R`; and
+- a writable temporary directory for the HDF5 simulation file and output figures.
+
+## What this document assumes
+
+This workflow assumes that the starting `phyloseq` object contains:
+
+- a count-based OTU table;
+- a sample-level identifier that can be used as row names for metadata; and
+- the clinical variables needed for the benchmarked models.
+
+In the present breast cancer analysis, the main outcome is `Relapse.binary`, and the covariate-adjusted benchmark adjusts for `ki67_ihc`, `bmi_calculated`, `ln_tumorpositive.binary`.
+
+# User configuration
+
+Edit this chunk before running the document. The paths below are examples and should be replaced with the locations on your own system.
+
+```{r config}
+# Paths that users should modify -------------------------------------------
+
+# Making sure SIMBA is available
+
+# PREFERRED OPTION:
+# Installed via GitHub
+# devtools::install_github(repo="https://github.com/microbiomix/SIMBA")
+suppressWarnings(library(simbaR))
+
+# Alternatively, use a local path to the patched SIMBA fork
+# Use this if you have not installed simbaR from github
+# Pass this to 'run_method_eval_parallel()' via simba.loc argument
+simba.loc <- "/path/to/microbiomix/SIMBA"
+
+# Directory containing helper_functions.R and sensitivity_functions.R
+code.loc <- "/path/to/analysis/helpers"
+
+# Writable directory for figure outputs
+out.loc <- "/path/to/output/"
+
+# Writable directory for simulation HDF5 files
+simh5.loc <- "/path/to/output/"
+
+dir.create(out.loc, recursive = TRUE, showWarnings = FALSE)
+
+# Input phyloseq object
+ps_rds <- "/path/to/ps.motus_raw.3.0.3.rds"
+
+# Number of CPUs to use when parallelizing DA test benchmarks
+n_cpus <- 8
+```
+
+```{r hidden-config, message=FALSE, warning=FALSE, include=FALSE}
+simba.loc <- "."
+code.loc <- "./"
+out.loc <- "./figures/"
+simh5.loc <- "/scratch/mjq180/SIMBA/"
+ps_rds <- "/projects/arumugam/people/xhf865/Camila/BreastCancer/phyloseq/ps.motus_raw.3.0.3.rds"
+n_cpus <- 121
+```
+
+# Load packages and helper functions
+
+The benchmark relies on the patched SIMBA code together with the helper functions used to extract calibration summaries and generate the final figures.
+
+```{r mysetup, message=FALSE, warning=FALSE}
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(phyloseq))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(purrr))
+suppressWarnings(library(stringr))
+suppressWarnings(library(tibble))
+suppressWarnings(library(rhdf5))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(patchwork))
+suppressWarnings(library(ANCOMBC))
+suppressWarnings(library(DESeq2))
+suppressWarnings(library(edgeR))
+suppressWarnings(library(metagenomeSeq))
+suppressWarnings(library(LinDA))
+suppressWarnings(library(compositions))
+suppressWarnings(library(DT))
+
+# Load companion helper functions used throughout the workflow
+source(file.path(code.loc, "helper_functions.R"))
+source(file.path(code.loc, "helper_detectability.R"))
+
+```
+
+# Load and prepare the phyloseq object
+
+## Global analysis settings
+
+These settings define the minimum prevalence filter used throughout the analysis and the significance threshold used in the main benchmark summaries. They also define the number of reps made in the simulation, and how many of them are used for benchmarking.
+
+```{r globals}
+REPS_MADE <- 50
+REPS_USED <- 50
+MIN_BENCHMARK_PREVALENCE <- 0.10
+MIN_DISCOVERY_PREVALENCE <- 0.10
+ALPHA <- 0.10
+param_set <- paste("alpha", ALPHA, "prev", MIN_BENCHMARK_PREVALENCE, "reps", REPS_USED, sep = "_")
+```
+
+## Read the phyloseq object and apply prevalence filtering
+
+We begin from the downloaded `phyloseq` object and remove taxa with prevalence below the chosen threshold.
+
+```{r load-phyloseq}
+ps_orig <- readRDS(ps_rds)
+ps_orig <- subset_samples(ps_orig, DiseaseStatus.binary == 2 &
+                       !is.na(relapse.binary) &
+                       !is.na(ln_tumorpositive.binary) &
+                       !is.na(ki67_ihc) &
+                       !is.na(tumor_size) &
+                       !is.na(bmi_calculated))
+ps <- filter_taxa_by_prevalence(ps_orig, MIN_BENCHMARK_PREVALENCE)
+```
+
+## Prepare metadata for SIMBA
+
+SIMBA expects a plain metadata data frame with samples in rows. In this analysis we keep only the variables needed for benchmarking and covariate-adjusted method comparisons.
+
+```{r prepare-metadata}
+meta <- sample_data(ps) %>%
+  unclass() %>%
+  as.data.frame() %>%
+  select(participant_id,
+         DNA_ID,
+         relapse.binary,
+         ln_tumorpositive.binary,
+         bmi_calculated,
+         ki67_ihc,
+         tumor_size
+         )
+meta$Individual_ID <- as.character(meta$participant_id)
+meta$participant_id <- NULL
+meta$relapse.binary <- as.numeric(meta$relapse.binary)
+meta$Timepoint <- 1
+rownames(meta) <- meta$DNA_ID
+meta$DNA_ID <- NULL
+
+sample_data(ps) <- meta
+```
+
+## Prepare the count table for SIMBA
+
+The signal implantation framework uses integer counts. We therefore extract the OTU table from `phyloseq`, keep taxa as rows, and round to integer counts.
+
+```{r prepare-counts}
+feat <- otu_table(ps) %>%
+  unclass() %>%
+  as.data.frame()
+
+rownames(feat) <- taxa_names(ps)
+feat[] <- lapply(feat, function(x) as.integer(round(x)))
+```
+
+The same workflow can be applied to any metagenomic count table that follows the same basic structure.
+
+```{r show-data}
+feat[1:3, 1:3]
+meta[1:3, 2:4]
+```
+
+# Define simulation parameters
+
+We now specify the filtering parameters used internally by SIMBA, the proportion of implanted marker taxa, class balance, subset size, the abundance-shift grid and the number of simulation repeats.
+
+In this benchmark, `ab.scale` is the primary implanted effect-size parameter. We set `prev.scale = 0`, meaning that signals are implanted as abundance differences without additional prevalence shifts.
+
+```{r parameters}
+# SIMBA filtering parameters stored in the HDF5 file
+ab.cutoff <- 1e-04
+prev.cutoff <- MIN_BENCHMARK_PREVALENCE
+log.n0 <- 1e-05
+
+# Simulation design
+prop.markers <- 0.1
+class.balance <- 15 / 99
+subset_size <- 99
+sim_reps <- REPS_MADE
+
+# Implanted effect sizes
+ab.scale <- seq(1, 10, 0.5)
+prev.scale <- 0
+```
+
+# Generate the signal-implantation simulations
+
+The patched SIMBA workflow preserves the original sample-to-metadata mapping and allows covariates to remain attached to the same samples during benchmarking. This is crucial when the downstream methods use covariate adjustment.
+
+## Create the simulation HDF5 file
+
+Because labels are fixed in this benchmark, we only need one testing-index repetition for each subset size.
+
+```{r create-simulation-markers, message=FALSE}
+
+force_simulation <- FALSE
+param_set1 <- paste("prev", MIN_BENCHMARK_PREVALENCE, "reps", REPS_MADE, sep = "_")
+sim.implant <- file.path(simh5.loc, paste0("recurrence_", param_set1, "_implantation.h5"))
+if (!file.exists(sim.implant) || force_simulation) {
+  set.seed(42)
+  file.remove(sim.implant)
+  system.time(
+    create.data.simulation(
+      feat = feat,
+      meta = meta,
+      sim.location = sim.implant,
+      sim.type = "cross-section",
+      sim.method = "resampling",
+      filt.params = list(
+        ab.cutoff = as.numeric(ab.cutoff),
+        prev.cutoff = prev.cutoff,
+        log.n0 = as.numeric(log.n0)
+      ),
+      sim.params = list(
+        ab.scale = ab.scale,
+        prev.scale = prev.scale,
+        prop.markers = prop.markers,
+        conf = NULL,
+        class.balance = class.balance,
+        feature.type = "all",
+        fixed.labels = TRUE,
+        factorize.metadata = FALSE,
+        label.col = "relapse.binary",
+        case.value = 2,
+        control.value = 1,
+        repeats = sim_reps
+      )
+    )
+  )
+  system.time(
+    create.test.idx(
+      sim.location = sim.implant,
+      subsets = subset_size,
+      repetitions = 1,
+      fixed.labels = TRUE
+    )
+  )
+
+}
+```
+
+```{r create-simulation-null, message=FALSE}
+
+force_simulation <- FALSE
+
+NULL_REPS <- 300
+ab.scale <- c(1)
+param_set1 <- paste("prev", MIN_BENCHMARK_PREVALENCE, "reps", NULL_REPS, sep = "_")
+sim.null <- file.path(simh5.loc, paste0("recurrence_", param_set1, "_null.h5"))
+if (!file.exists(sim.null) || force_simulation) {
+  set.seed(42)
+  file.remove(sim.null)
+  system.time(
+    create.data.simulation(
+      feat = feat,
+      meta = meta,
+      sim.location = sim.null,
+      sim.type = "cross-section",
+      sim.method = "resampling",
+      filt.params = list(
+        ab.cutoff = as.numeric(ab.cutoff),
+        prev.cutoff = prev.cutoff,
+        log.n0 = as.numeric(log.n0)
+      ),
+      sim.params = list(
+        ab.scale = ab.scale,
+        prev.scale = prev.scale,
+        prop.markers = prop.markers,
+        conf = NULL,
+        class.balance = class.balance,
+        feature.type = "all",
+        fixed.labels = FALSE,
+        factorize.metadata = FALSE,
+        label.col = "relapse.binary",
+        case.value = 2,
+        control.value = 1,
+        repeats = NULL_REPS
+      )
+    )
+  )
+  system.time(
+    create.test.idx(
+      sim.location = sim.null,
+      subsets = subset_size,
+      repetitions = 1,
+      fixed.labels = FALSE
+    )
+  )
+
+}
+```
+
+A quick look at the simulation groups confirms that the HDF5 file contains one group per implanted effect-size setting.
+
+```{r list-simulation-groups}
+temp <- rhdf5::h5ls(sim.implant, recursive = FALSE)
+length(setdiff(temp$name, c("original_data", "simulation_parameters")))
+setdiff(temp$name, c("original_data", "simulation_parameters"))[1:10]
+rm(temp)
+```
+
+# Reality check for the simulations
+
+Before running the benchmark, it is useful to verify that the implanted samples still resemble the original data structure. Principal coordinates analysis (PCoA) can be used as a simple visual check.
+
+```{r pcoa-plots, fig.width=8, fig.height=7}
+pcoa.implant <- pcoa.plot(sim.implant, "ab1_prev1_rep1", "bray") +
+  labs(title = "Signal implantation")
+pcoa.implant
+pcoa.null <- pcoa.plot(sim.null, "ab1_prev1_rep1", "bray") +
+  labs(title = "Signal implantation - null")
+pcoa.null
+```
+
+# Prepare the benchmark groups
+
+SIMBA stores one HDF5 group per simulation setting. The chunks below identify all groups and restrict the analysis to the intended number of simulation repeats.
+
+```{r prepare-groups}
+temp <- rhdf5::h5ls(sim.implant, recursive = FALSE)
+groups <- setdiff(temp$name, c("original_data", "simulation_parameters"))
+
+# Keep abundance-scale groups with the single prevalence setting used here.
+groups.sub <- groups[grepl("^ab[0-9]+_prev1_rep[0-9]+$", groups)]
+
+# Restrict to the requested number of simulation repeats.
+groups.sub <- groups.sub[
+  as.integer(stringr::str_match(groups.sub, "^ab[0-9]+_prev1_rep([0-9]+)$")[, 2]) <= REPS_USED
+]
+
+temp <- rhdf5::h5ls(sim.null, recursive = FALSE)
+groups <- setdiff(temp$name, c("original_data", "simulation_parameters"))
+
+# Keep abundance-scale groups with the single prevalence setting used here.
+groups.sub.null <- groups[grepl("^ab[0-9]+_prev1_rep[0-9]+$", groups)]
+
+rm(temp, groups)
+```
+
+
+# Benchmark multiple differential abundance methods
+
+The benchmark runs one method at a time across all simulated groups and then aggregates performance metrics across repeats.
+
+## Run the implantation-based benchmark
+
+The normalization strategy and covariate adjustment are chosen separately for each method. Calibration tables are also extracted where available, as they are needed later for detectability-boundary analyses.
+
+```{r benchmark-many-methods, message=FALSE, warning=FALSE, results='hide'}
+
+test_names <- c(
+  "LinDA",
+  "metagenomeSeq",
+  "ANCOMBC2", "ANCOMBC",
+  "DESeq2", "lm", "edgeR"
+)
+
+force_DA_tests <- FALSE
+filename = file.path(simh5.loc, paste0("recurrence_", param_set, "_eval_summary.rds"))
+if (!file.exists(filename) || force_DA_tests) {
+  
+  # Modify this 
+  n_workers <- n_cpus
+  
+  if (n_workers > 1) {
+    future::plan(future::multisession, workers = n_workers)
+  } else {
+    future::plan("sequential")
+  }
+  
+  method_results_recurrence <- test_names %>%
+    set_names() %>%
+    purrr::map(function(test_name) {
+      # Method-specific normalization
+      norm_method <- dplyr::case_when(
+        test_name == "lm" ~ "clr_halfmin",
+        test_name == "wilcoxon" ~ "TSS",
+        test_name == "LinDA" ~ "TSS",
+        TRUE ~ "pass"
+      )
+      
+      # Covariate adjustment where relevant
+      covariates <- NULL
+      if (test_name %in% c("LinDA", "metagenomeSeq", "lm", "ANCOMBC", "ANCOMBC2", "DESeq2", "edgeR")) {
+        covariates <- c("bmi_calculated", "ki67_ihc", "ln_tumorpositive.binary")
+      }
+      
+      # Some methods do not currently return effect sizes in the patched workflow
+      return_calib <- TRUE
+      
+      simbaR::run_method_eval_parallel(
+        test_name = test_name,
+        groups.sub = groups.sub,
+        sim.implant = sim.implant,
+        subset_size = subset_size,
+        ab.scale = ab.scale,
+        alpha = ALPHA,
+        norm = norm_method,
+        covariates = covariates,
+        seed = TRUE,
+        show_progress = TRUE,
+        simba.loc = NULL,
+        return_calib = return_calib
+      )
+    })
+  saveRDS(method_results_recurrence, file = filename)
+} else {
+  method_results_recurrence <- readRDS(file = filename)
+}
+
+```
+
+## Summarize benchmark performance
+
+```{r benchmark-summary}
+master_evals_recurrence <- dplyr::bind_rows(purrr::map(method_results_recurrence, "evals"))
+
+power_combined_benchmark_recurrence <- master_evals_recurrence %>%
+  dplyr::filter(test %in% test_names) %>%
+  group_by(test, ab_scale, prev_index) %>%
+  summarise(
+    mean_power = mean(power, na.rm = TRUE),
+    sd_power = sd(power, na.rm = TRUE),
+    mean_fdr = mean(empirical_fdr, na.rm = TRUE),
+    sd_fdr = sd(empirical_fdr, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_auroc = mean(auroc, na.rm = TRUE),
+    mean_abs_eff_tp2 = mean(mean_abs_eff_tp, na.rm = TRUE),
+    sd_abs_eff_tp = sd(mean_abs_eff_tp, na.rm = TRUE),
+    mean_abs_eff_marker2 = mean(mean_abs_eff_marker, na.rm = TRUE),
+    sd_abs_eff_marker = sd(mean_abs_eff_marker, na.rm = TRUE),
+    n_reps = n(),
+    .groups = "drop"
+  )
+
+datatable(power_combined_benchmark_recurrence)
+```
+
+## Visualize benchmark performance
+
+These plots provide the benchmark overview used to select methods for the downstream detectability analyses.
+
+```{r benchmark-viz, fig.width=8, fig.height=10}
+plot_df <- power_combined_benchmark_recurrence %>%
+  filter(test %in% test_names) %>%
+  mutate(test = factor(test, levels = test_names))
+
+p_fdr <- ggplot(plot_df, aes(x = ab_scale, y = mean_fdr, color = test, group = test)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(0, mean_fdr - sd_fdr),
+      ymax = pmin(1, mean_fdr + sd_fdr)
+    ),
+    width = 0.08,
+    alpha = 0.6
+  ) +
+  geom_hline(yintercept = 0.15, linetype = 2) +
+  scale_x_continuous(limits = c(0.5, 10), breaks = seq(1, 10)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Implanted effect size",
+    y = "FDR",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+p_power <- ggplot(plot_df, aes(x = ab_scale, y = mean_power, color = test, group = test)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(0, mean_power - sd_power),
+      ymax = pmin(1, mean_power + sd_power)
+    ),
+    width = 0.08,
+    alpha = 0.6
+  ) +
+  geom_hline(yintercept = 0.40, linetype = 2) +
+  scale_x_continuous(limits = c(0.5, 10), breaks = seq(1, 10)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Implanted effect size",
+    y = "Power",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+recurrence_summary_plot <- ((p_power + labs(tag = "a")) / (p_fdr + labs(tag = "b"))) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    plot.tag = element_text(size = 20, face = "bold")
+  )
+
+recurrence_summary_plot
+
+ggsave(filename = file.path(out.loc, paste0("recurrence_", param_set, "_summary.pdf")), 
+       plot = recurrence_summary_plot,
+       device = cairo_pdf,
+       width = 8,
+       height = 10)
+ggsave(filename = file.path(out.loc, paste0("recurrence_", param_set, "_power.pdf")), plot = p_power, width = 8, height = 5)
+ggsave(filename = file.path(out.loc, paste0("recurrence_", param_set, "_fdr.pdf")), plot = p_fdr, width = 8, height = 5)
+```
+
+## Build the calibration table
+
+The calibration analysis uses method-specific p-values and effect sizes extracted from the benchmarked simulations.
+
+```{r calibration-analysis}
+master_calib_recurrence <- dplyr::bind_rows(purrr::map(method_results_recurrence, "calib_df")) %>%
+  mutate(
+    detected = as.logical(padj < ALPHA),
+    is_tp = as.logical(detected & is_marker),
+    is_fp = as.logical(detected & !is_marker)
+  )
+```
+
+# Select methods for interpretability analysis
+
+Only methods that jointly satisfy the chosen benchmark criteria are carried forward into the detectability-boundary plots. We have relaxed the criteria to be: above 40% power and below 15% FDR.
+
+```{r select-methods}
+good_ones <- power_combined_benchmark_recurrence %>%
+  filter(mean_power > 0.40 & mean_fdr < 0.15) %>%
+  group_by(test) %>%
+  filter(rank(ab_scale, ties.method = "first") == 1) %>%
+  arrange(ab_scale, test)
+datatable(good_ones)
+
+methods_keep <- sort(good_ones$test)
+methods_keep
+```
+
+# Generating background distribution
+
+## Label-shuffled simulations of real data for generating background null distribution
+
+```{r benchmark-many-methods-null, message=FALSE, warning=FALSE, results='hide'}
+
+test_names <- methods_keep
+
+force_DA_tests <- FALSE
+filename = file.path(simh5.loc, paste0("recurrence_", NULL_REPS, "_eval_summary_null.rds"))
+if (!file.exists(filename) || force_DA_tests) {
+  
+  # Modify this 
+  n_workers <- n_cpus
+  
+  if (n_workers > 1) {
+    future::plan(future::multisession, workers = n_workers)
+  } else {
+    future::plan("sequential")
+  }
+  
+  method_results_recurrence_null <- test_names %>%
+    set_names() %>%
+    purrr::map(function(test_name) {
+      # Method-specific normalization
+      norm_method <- dplyr::case_when(
+        test_name == "lm" ~ "clr_halfmin",
+        test_name == "wilcoxon" ~ "TSS",
+        test_name == "LinDA" ~ "TSS",
+        TRUE ~ "pass"
+      )
+      
+      # Covariate adjustment where relevant
+      covariates <- NULL
+      if (test_name %in% c("LinDA", "metagenomeSeq", "lm", "ANCOMBC", "ANCOMBC2", "DESeq2", "edgeR")) {
+        covariates <- c("bmi_calculated", "ki67_ihc", "ln_tumorpositive.binary")
+      }
+      
+      # Some methods do not currently return effect sizes in the patched workflow
+      return_calib <- TRUE
+      
+      simbaR::run_method_eval_parallel(
+        test_name = test_name,
+        groups.sub = groups.sub.null,
+        sim.implant = sim.null,
+        subset_size = subset_size,
+        ab.scale = ab.scale,
+        alpha = ALPHA,
+        norm = norm_method,
+        covariates = covariates,
+        seed = TRUE,
+        show_progress = TRUE,
+        simba.loc = NULL,
+        return_calib = return_calib
+      )
+    })
+  saveRDS(method_results_recurrence_null, file = filename)
+} else {
+  method_results_recurrence_null <- readRDS(file = filename) 
+}
+
+```
+
+## Build the calibration table for null
+
+```{r build-calibration-table-null}
+master_calib_recurrence_null <- dplyr::bind_rows(purrr::map(method_results_recurrence_null, "calib_df")) %>%
+  mutate(
+    detected = as.logical(padj < ALPHA),
+    is_tp = FALSE,
+    is_fp = as.logical(detected)
+  )
+```
+## How many times were there false positives from the null simulation?
+
+```{r null-false-positives}
+master_calib_recurrence_null %>%
+  dplyr::filter(is_fp, test %in% methods_keep) %>%
+  group_by(test) %>%
+  summarise(count=n())
+
+master_calib_recurrence_null %>%
+  dplyr::filter(is_fp, test %in% methods_keep) %>%
+  group_by(feature) %>%
+  summarise(times_detected=n()) %>%
+  filter(times_detected > 0) %>%
+  group_by(times_detected) %>%
+  summarise(freq=n())
+
+```
+
+# Run the real-data differential abundance analyses
+
+The next step is to run the corresponding differential abundance methods on the real breast cancer case/control data. These results are then compared with the simulation-derived detectability boundaries.
+
+```{r real-data-DA-analysis, message=FALSE, warning=FALSE, results='hide'}
+
+# prepare the tables
+ps2 <- filter_taxa_by_prevalence(ps, MIN_DISCOVERY_PREVALENCE)
+ps2rel <- transform_sample_counts(ps2, function(x) x / sum(x))
+real_feat_relab <- as(otu_table(ps2rel), "matrix")
+real_feat_relab <- as.data.frame(real_feat_relab[, rownames(meta)])
+
+force_DA_tests <- FALSE
+
+param_set2 <- paste("alpha", ALPHA, "prev", MIN_DISCOVERY_PREVALENCE, "reps", REPS_USED, sep = "_")
+filename = file.path(simh5.loc, paste0("recurrence_", param_set2, "_real_data.rds"))
+
+if (!file.exists(filename) || force_DA_tests) {
+  
+  # Encode from 1/2 to 0/1
+  
+  meta$relapse.binary <- meta$relapse.binary - 1
+  sample_data(ps2) <- meta
+  
+  # ANCOMBC2
+  res_ancombc2 <- ancombc2(
+    data = ps2,
+    fix_formula = "relapse.binary + bmi_calculated + ki67_ihc + ln_tumorpositive.binary",
+    rand_formula = NULL,
+    p_adj_method = "fdr",
+    prv_cut = MIN_DISCOVERY_PREVALENCE,
+    lib_cut = 1000,
+    alpha = ALPHA
+  )
+  # Filter for sensitivity analysis
+  res_ancombc2$res <- res_ancombc2$res %>%
+    dplyr::mutate(p_relapse.binary = replace(p_relapse.binary, passed_ss_relapse.binary != TRUE, 1))
+  
+  # ANCOMBC
+  res_ancombc <- ancombc(
+    data = ps2,
+    formula = "relapse.binary + bmi_calculated + ki67_ihc + ln_tumorpositive.binary",
+    p_adj_method = "fdr",
+    pseudo = 1,
+    prv_cut = MIN_DISCOVERY_PREVALENCE,
+    lib_cut = 1000
+  )
+  
+  # Re-encode from 0/1 to -1/+1
+  newlabel <- as.numeric(meta$relapse.binary)
+  newlabel[newlabel == 0] <- -1
+  # newlabel[newlabel == 1] <- 1
+  meta$relapse.binary <- newlabel
+  
+  # lm on clr-transformed abundance with a half-minimum pseudocount
+  tab_analysis <- as(otu_table(ps2), "matrix")
+  pseudo <- min(tab_analysis[tab_analysis > 0]) / 2
+  tab_analysis[tab_analysis == 0] <- pseudo
+  tab_analysis <- as.data.frame(apply(tab_analysis, 1, compositions::clr))
+  
+  fit_one <- function(y, meta) {
+    d <- cbind(meta, y = y)
+    fit <- stats::lm(y ~ relapse.binary + bmi_calculated + ki67_ihc + ln_tumorpositive.binary, data = d)
+    res <- broom.mixed::tidy(fit, effects = "fixed")
+    res[res$term == "relapse.binary", ]
+  }
+  
+  res_lm <- apply(tab_analysis, MARGIN=2, FUN = fit_one, meta = meta) %>%
+    bind_rows(.id = "OTU") %>%
+    mutate(padj = p.adjust(p.value, method = "fdr"))
+  
+  # LinDA on relative abundance
+  
+  meta$relapse.binary = factor(meta$relapse.binary, levels=c(-1, 1))
+  res_linda <- LinDA::linda(
+    real_feat_relab,
+    meta,
+    formula = "~ relapse.binary + bmi_calculated + ki67_ihc + ln_tumorpositive.binary",
+    alpha = ALPHA,
+    p.adj.method = "BH",
+    type = "proportion"
+  )
+  
+  # metagenomeSeq
+  
+  sample_data(ps2) <- meta # take the version with factors and -1/+1
+  
+  m <- phyloseq_to_metagenomeSeq(ps2)
+  m2 <- filterData(m, present = nsamples(ps2) * MIN_DISCOVERY_PREVALENCE, depth = 1000)
+  p <- cumNormStat(m2)
+  m2 <- cumNorm(m2, p = p)
+  pd <- pData(m2)
+  
+  mod1 <- model.matrix(~ relapse.binary + bmi_calculated + ki67_ihc + ln_tumorpositive.binary, data = pd)
+  res1 <- fitZig(m2, mod1, control = zigControl(maxit = 20, verbose = FALSE))
+  res_metagenomeSeq <- MRcoefs(res1, number = nrow(res1), adjustMethod = "fdr")
+  
+  # Store raw p-values and effect sizes for downstream interpretability analyses
+  p_lm_real <- as.numeric(res_lm$p.value)
+  eff_lm_real <- as.numeric(res_lm$estimate)
+  p_linda_real = res_linda$output$relapse.binary$pvalue
+  eff_linda_real = res_linda$output$relapse.binary$log2FoldChange
+  p_mgs_real <- res_metagenomeSeq$pvalues
+  eff_mgs_real <- res_metagenomeSeq$relapse.binary1
+  p_ancombc_real <- res_ancombc$res$p_val$relapse.binary
+  eff_ancombc_real <- res_ancombc$res$lfc$relapse.binary
+  p_ancombc2_real <- res_ancombc2$res$p_relapse.binary
+  eff_ancombc2_real <- res_ancombc2$res$lfc_relapse.binary
+  
+  names(p_lm_real) <- rownames(real_feat_relab)
+  names(eff_lm_real) <- rownames(real_feat_relab)
+  names(p_linda_real) <- rownames(real_feat_relab)
+  names(eff_linda_real) <- rownames(real_feat_relab)
+  names(p_mgs_real) <- rownames(real_feat_relab)
+  names(eff_mgs_real) <- rownames(real_feat_relab)
+  names(p_ancombc_real) <- rownames(real_feat_relab)
+  names(eff_ancombc_real) <- rownames(real_feat_relab)
+  names(p_ancombc2_real) <- res_ancombc2$res$taxon
+  names(eff_ancombc2_real) <- res_ancombc2$res$taxon
+  
+  real_results_recurrence <- list(
+    lm = list(pval = p_lm_real, eff = eff_lm_real),
+    LinDA = list(pval = p_linda_real, eff = eff_linda_real),
+    ANCOMBC = list(pval = p_ancombc_real, eff = eff_ancombc_real),
+    ANCOMBC2 = list(pval = p_ancombc2_real, eff = eff_ancombc2_real),
+    metagenomeSeq = list(pval = p_mgs_real, eff = eff_mgs_real)
+  )
+  
+  saveRDS(real_results_recurrence, file = filename)
+} else {
+  real_results_recurrence <- readRDS(file = filename)
+}
+
+```
+
+
+# Plot the combined evidence from lm and LinDA
+
+```{r plot-combined-evidence, fig.width=10, fig.height=3.5}
+real_prevalence <- rowMeans(feat > 0)
+
+res_bound_abund_recurrence <- run_casecontrol_upper_bound_abundance(
+  master_calib = master_calib_recurrence %>% filter(ab_scale > 1),
+  feat_real = real_feat_relab,
+  methods = methods_keep,
+  real_results_list = real_results_recurrence,
+  prevalence = real_prevalence,
+  target_prob = 0.8,
+  adjust = "fdr",
+  alpha = ALPHA,
+  analysis_subset_col = "is_marker",
+  response_col = "detected",
+  formula = good_bin ~
+        s(effect, k = 4, bs = "ts") +
+        s(prevalence, k = 4, bs = "ts") +
+        s(abundance, k = 4, bs = "ts")
+)
+
+p_linda <- plot_recurrence_volcano(
+  real_df = res_bound_abund_recurrence$real_df,
+  method = "LinDA",
+  candidate_feature = "meta_mOTU_v3_12389",
+  title = "LinDA"
+) +
+  coord_cartesian(ylim = c(0, 4.5)) +
+    ggplot2::theme(
+    aspect.ratio = 1,
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 12,
+      hjust = 0.5
+    ),
+    axis.title = ggplot2::element_text(size = 10),
+    axis.text = ggplot2::element_text(size = 9),
+    plot.caption = ggplot2::element_blank()
+  ) 
+
+p_lm <- plot_recurrence_volcano(
+  real_df = res_bound_abund_recurrence$real_df,
+  method = "lm",
+  candidate_feature = "meta_mOTU_v3_12389",
+  title = "Linear model"
+) +
+  coord_cartesian(ylim = c(0, 4.5)) +
+    ggplot2::theme(
+    aspect.ratio = 1,
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 12,
+      hjust = 0.5
+    ),
+    axis.title = ggplot2::element_text(size = 10),
+    axis.text = ggplot2::element_text(size = 9),
+    plot.caption = ggplot2::element_blank()
+  ) 
+
+extreme_res <- plot_null_p_effect_extremeness(
+  master_calib = master_calib_recurrence_null,
+  real_df = res_bound_abund_recurrence$real_df,
+  observed_feature = "meta_mOTU_v3_12389",
+  methods = c("LinDA", "lm"),
+  show_caption = FALSE,
+  annotation_dx = 0.05,
+  annotation_dy = -0.1,
+  annotation_text_size = 3,
+  plot_title = NULL
+)
+p_shuffle <- extreme_res$plot +
+  scale_y_continuous(
+    limits = c(0, 1.05),
+    breaks = seq(0, 1, by = 0.2),
+    labels = c("0", "0.2", "0.4", "0.6", "0.8", "1.0")
+  ) +
+  ggplot2::theme(
+    aspect.ratio = 1,
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 12,
+      hjust = 0.5
+    ),
+    axis.title = ggplot2::element_text(size = 10),
+    axis.text = ggplot2::element_text(size = 9),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.caption = ggplot2::element_blank()
+  ) +
+  ggplot2::labs(
+    title = "Shuffled-label calibration",
+    x = expression(sum(-log[10](p)))
+  )
+
+p_recurrence_package <- cowplot::plot_grid(
+  p_linda,
+  p_lm,
+  p_shuffle,
+  labels = c("a", "b", "c"),
+  label_size = 14,
+  label_fontface = "bold",
+  nrow = 1,
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1, 1)
+)
+
+p_recurrence_package
+ggsave(
+  filename = file.path(out.loc, paste0("recurrence_", param_set, "_detected_taxon.pdf")),
+  plot = p_recurrence_package,
+  device = cairo_pdf,
+  width = 10,
+  height = 3.5
+)
+
+```
+
+
+```{r knitting, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "Recurrence_detectability_analysis.Rmd",
+  output_file = "Recurrence_detectability_analysis.html",
+  output_dir = "."
+)
+```
+
+# Session information
+
+Session information is printed below to document package versions and the computational environment used for the analysis.
+
+```{r session-info}
+sessionInfo()
+```
