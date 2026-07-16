@@ -1,0 +1,1206 @@
+---
+title: "Breast cancer microbiome case/control signal implantation benchmark analysis using SIMBA"
+author:
+  - name: "Mani Arumugam"
+    affiliation: "University of Copenhagen"
+    email: "arumugam@sund.ku.dk"
+date: "Date last modified: 16-07-2026"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+vignette: >
+  %\VignetteIndexEntry{Breast cancer microbiome case/control signal implantation benchmark analysis using SIMBA}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Overview
+
+This document is a step-by-step walkthrough for reproducing the breast cancer status detectability analysis in the manuscript. The analysis starts from a single `phyloseq` object and proceeds through four main stages:
+
+1. prepare the count table and sample metadata;
+2. generate signal-implantation simulations with a patched version of SIMBA;
+3. benchmark multiple differential abundance methods on the simulated data; and
+4. compare the real-data results with simulation-derived detectability boundaries.
+
+The goal is not only to reproduce the figures in the manuscript, but also to make the logic of the workflow transparent to anyone who wants to rerun or adapt it to a comparable dataset.
+
+# Before you start
+
+## Required inputs
+
+To reproduce the analysis, you will need:
+
+- a `phyloseq` object containing the taxon count table and sample metadata;
+- installation of the patched SIMBA fork from https://github.com/microbiomix/SIMBA
+  - (use `devtools::install_github(repo="https://github.com/microbiomix/SIMBA")`)
+- the companion helper scripts `helper_functions.R`, `helper_detectability.R`; and
+- a writable temporary directory for the HDF5 simulation file and output figures.
+
+## What this document assumes
+
+This workflow assumes that the starting `phyloseq` object contains:
+
+- a count-based OTU table;
+- a sample-level identifier that can be used as row names for metadata; and
+- the clinical variables needed for the benchmarked models.
+
+In the present breast cancer analysis, the main outcome is `DiseaseStatus.binary`, and the covariate-adjusted benchmark adjusts for `Age`.
+
+# User configuration
+
+Edit this chunk before running the document. The paths below are examples and should be replaced with the locations on your own system.
+
+```{r config}
+# Paths that users should modify -------------------------------------------
+
+# Making sure SIMBA is available
+
+# PREFERRED OPTION:
+# Installed via GitHub
+# devtools::install_github(repo="https://github.com/microbiomix/SIMBA")
+suppressWarnings(library(simbaR))
+
+# Alternatively, use a local path to the patched SIMBA fork
+# Use this if you have not installed simbaR from github
+# Pass this to 'run_method_eval_parallel()' via simba.loc argument
+simba.loc <- "/path/to/microbiomix/SIMBA"
+
+# Directory containing helper_functions.R and sensitivity_functions.R
+code.loc <- "/path/to/analysis/helpers"
+
+# Writable directory for figure outputs
+out.loc <- "/path/to/output/"
+
+# Writable directory for simulation HDF5 files
+simh5.loc <- "/path/to/output/"
+
+dir.create(out.loc, recursive = TRUE, showWarnings = FALSE)
+
+# Input phyloseq object
+ps_rds <- "/path/to/ps.motus_raw.3.0.3.rds"
+
+# Number of CPUs to use when parallelizing DA test benchmarks
+n_cpus <- 8
+```
+
+```{r hidden-config, message=FALSE, warning=FALSE, include=FALSE}
+simba.loc <- "."
+code.loc <- "./"
+out.loc <- "./figures/"
+simh5.loc <- "/scratch/mjq180/SIMBA/"
+ps_rds <- "/projects/arumugam/people/xhf865/Camila/BreastCancer/phyloseq/ps.motus_raw.3.0.3.rds"
+n_cpus <- 121
+```
+
+# Load packages and helper functions
+
+The benchmark relies on the patched SIMBA code together with the helper functions used to extract calibration summaries and generate the final figures.
+
+```{r mysetup, message=FALSE, warning=FALSE}
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(phyloseq))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(purrr))
+suppressWarnings(library(stringr))
+suppressWarnings(library(tibble))
+suppressWarnings(library(rhdf5))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(patchwork))
+suppressWarnings(library(ANCOMBC))
+suppressWarnings(library(metagenomeSeq))
+suppressWarnings(library(LinDA))
+suppressWarnings(library(DESeq2))
+suppressWarnings(library(edgeR))
+suppressWarnings(library(compositions))
+suppressWarnings(library(DT))
+
+# Load companion helper functions used throughout the workflow
+source(file.path(code.loc, "helper_functions.R"))
+source(file.path(code.loc, "helper_detectability.R"))
+```
+
+# Load and prepare the phyloseq object
+
+## Global analysis settings
+
+These settings define the minimum prevalence filter used throughout the analysis and the significance threshold used in the main benchmark summaries. They also define the number of reps made in the simulation, and how many of them are used for benchmarking.
+
+```{r globals}
+REPS_MADE <- 50
+REPS_USED <- 50
+MIN_BENCHMARK_PREVALENCE <- 0.10
+MIN_DISCOVERY_PREVALENCE <- 0.10
+ALPHA <- 0.10
+param_set <- paste("alpha", ALPHA, "prev", MIN_BENCHMARK_PREVALENCE, "reps", REPS_USED, sep = "_")
+```
+
+## Read the phyloseq object and apply prevalence filtering
+
+We begin from the downloaded `phyloseq` object and remove taxa with prevalence below the chosen threshold.
+
+```{r load-phyloseq}
+ps_orig <- readRDS(ps_rds)
+ps <- filter_taxa_by_prevalence(ps_orig, MIN_BENCHMARK_PREVALENCE)
+```
+
+## Prepare metadata for SIMBA
+
+SIMBA expects a plain metadata data frame with samples in rows. In this analysis we keep only the variables needed for benchmarking and covariate-adjusted method comparisons.
+
+```{r prepare-metadata}
+
+meta <- sample_data(ps) %>%
+  unclass() %>%
+  as.data.frame() %>%
+  select(
+    participant_id,
+    DNA_ID,
+    DiseaseStatus.binary,
+    Age,
+    bmi_calculated
+  )
+
+meta$Individual_ID <- as.character(meta$participant_id)
+meta$participant_id <- NULL
+meta$Timepoint <- 1
+rownames(meta) <- meta$DNA_ID
+meta$DNA_ID <- NULL
+
+sample_data(ps) <- meta
+```
+
+## Prepare the count table for SIMBA
+
+The signal implantation framework uses integer counts. We therefore extract the OTU table from `phyloseq`, keep taxa as rows, and round to integer counts.
+
+```{r prepare-counts}
+feat <- otu_table(ps) %>%
+  unclass() %>%
+  as.data.frame()
+
+rownames(feat) <- taxa_names(ps)
+feat[] <- lapply(feat, function(x) as.integer(round(x)))
+```
+
+
+# Define simulation parameters
+
+We now specify the filtering parameters used internally by SIMBA, the proportion of implanted marker taxa, class balance, subset size, the abundance-shift grid and the number of simulation repeats.
+
+In this benchmark, `ab.scale` is the primary implanted effect-size parameter. We set `prev.scale = 0`, meaning that signals are implanted as abundance differences without additional prevalence shifts.
+
+```{r parameters}
+# SIMBA filtering parameters stored in the HDF5 file
+ab.cutoff <- 1e-04
+prev.cutoff <- MIN_BENCHMARK_PREVALENCE
+log.n0 <- 1e-05
+
+# Simulation design
+prop.markers <- 0.1
+class.balance <- 101 / 261
+subset_size <- 261
+sim_reps <- REPS_MADE
+
+# Implanted effect sizes
+ab.scale <- seq(1, 10, 0.5)
+
+prev.scale <- 0
+```
+
+# Generate the signal-implantation simulations
+
+The patched SIMBA workflow preserves the original sample-to-metadata mapping and allows covariates to remain attached to the same samples during benchmarking. This is crucial when the downstream methods use covariate adjustment.
+
+## Create the simulation HDF5 file
+
+Because labels are fixed in this benchmark, we only need one testing-index repetition for each subset size.
+
+```{r create-simulation, message=FALSE}
+
+force_simulation <- FALSE
+seed <- 1234
+param_set1 <- paste("prev", MIN_BENCHMARK_PREVALENCE, "reps", REPS_MADE, sep = "_")
+sim.implant <- file.path(simh5.loc, paste0("BC_", param_set1, "_seed_", seed, "_implantation.h5"))
+if (!file.exists(sim.implant) || force_simulation) {
+  set.seed(seed)
+  if (file.exists(sim.implant)) {
+    file.remove(sim.implant)
+  }
+  system.time(
+    create.data.simulation(
+      feat = feat,
+      meta = meta,
+      sim.location = sim.implant,
+      sim.type = "cross-section",
+      sim.method = "resampling",
+      filt.params = list(
+        ab.cutoff = as.numeric(ab.cutoff),
+        prev.cutoff = prev.cutoff,
+        log.n0 = as.numeric(log.n0)
+      ),
+      sim.params = list(
+        ab.scale = ab.scale,
+        prev.scale = prev.scale,
+        prop.markers = prop.markers,
+        conf = NULL,
+        class.balance = class.balance,
+        feature.type = "all",
+        fixed.labels = TRUE,
+        factorize.metadata = FALSE,
+        label.col = "DiseaseStatus.binary",
+        case.value = 2,
+        control.value = 1,
+        repeats = sim_reps
+      )
+    )
+  )
+  system.time(
+    create.test.idx(
+      sim.location = sim.implant,
+      subsets = subset_size,
+      repetitions = 1,
+      fixed.labels = TRUE
+    )
+  )
+
+}
+```
+
+
+Compare sample-anchored labels that are stored
+
+```{r compare-labels-in-test-idx,, eval=FALSE, include=FALSE}
+library(rhdf5)
+
+g <- "ab1_prev1_rep1"
+subset_name <- "subset_261"
+
+grp <- h5read(sim.implant, g)
+params <- h5read(sim.implant, "simulation_parameters")
+
+# true labels written by simulate.resampling()
+true_label <- grp$labels
+sample_names <- grp$sample_names
+names(true_label) <- sample_names
+
+# metadata with preserved sample IDs
+meta2 <- h5read(sim.implant, "original_data/metadata")
+meta2 <- as.data.frame(meta2, stringsAsFactors = FALSE)
+rownames(meta2) <- meta2[["__sample_id"]]
+#meta[["__sample_id"]] <- NULL
+
+# stored test_idx object
+info.mat <- grp$test_idx[[subset_name]]
+rownames(info.mat) <- params[["test_idx"]][["names"]]
+
+# map index positions to sample names
+stored_sample_names <- sample_names[info.mat["rep1", ]]
+
+# compare stored label row to true labels / metadata labels for rep1
+data.frame(
+  sample = stored_sample_names,
+  stored_label = info.mat["label", ],
+  true_label = true_label[stored_sample_names],
+  meta_label = meta2[stored_sample_names, "DiseaseStatus.binary", drop = TRUE]
+)
+```
+
+A quick look at the simulation groups confirms that the HDF5 file contains one group per implanted effect-size setting.
+
+```{r list-simulation-groups}
+temp <- rhdf5::h5ls(sim.implant, recursive = FALSE)
+length(setdiff(temp$name, c("original_data", "simulation_parameters")))
+setdiff(temp$name, c("original_data", "simulation_parameters"))[1:10]
+rm(temp)
+```
+
+# Reality check for the simulations
+
+Before running the benchmark, it is useful to verify that the implanted samples still resemble the original data structure. Principal coordinates analysis (PCoA) can be used as a simple visual check.
+
+```{r pcoa-plots, collapse=TRUE, results='hold', fig.width=8, fig.height=7}
+pcoa.plot(sim.implant, "ab2_prev1_rep1", "bray") +
+  labs(title = "Signal implantation (ab.scale=1.5)")
+pcoa.plot(sim.implant, "ab5_prev1_rep1", "bray") +
+  labs(title = "Signal implantation (ab.scale=3)")
+pcoa.plot(sim.implant, "ab11_prev1_rep1", "bray") +
+  labs(title = "Signal implantation (ab.scale=5)")
+
+```
+
+As `ab.scale` increases, simulated samples are moving farther away from real samples. This is as expected and confirms that our label preservation patch works.
+
+# Verify our patched SIMBA
+
+Let's make sure that our modifications do not behave strange using some more sanity checks.
+
+Let us also check that the feature labels and sample labels are preserved.
+
+```{r compare-original-with-sim, collapse=TRUE, results='hold'}
+
+# ------------------------------------------------------------
+# Sanity check: labels and abundances are preserved across
+#   1) phyloseq object `ps`
+#   2) sim.implant/original_data
+#   3) sim.implant implanted group ab1_prev1_rep1
+# ------------------------------------------------------------
+
+g <- "ab1_prev1_rep1"
+
+# ---- 1. Extract matrix from phyloseq and ensure taxa are rows ----
+ps_mat <- as(otu_table(ps), "matrix")
+if (!taxa_are_rows(ps)) {
+  ps_mat <- t(ps_mat)
+}
+
+# ---- 2. Read original_data from HDF5 ----
+orig_feat <- h5read(sim.implant, "original_data/filt_features")
+orig_feat_names <- h5read(sim.implant, "original_data/filt_feature_names")
+orig_sample_names <- h5read(sim.implant, "original_data/sample_names")
+
+rownames(orig_feat) <- orig_feat_names
+colnames(orig_feat) <- orig_sample_names
+
+# ---- 3. Read one implanted group from HDF5 ----
+grp <- h5read(sim.implant, g)
+sim_feat <- grp$features
+rownames(sim_feat) <- grp$feature_names
+colnames(sim_feat) <- grp$sample_names
+
+# ---- 4. Check labels before reordering ----
+cat("Feature labels before reordering:\n")
+cat("  ps vs original_data: ", isTRUE(all.equal(rownames(ps_mat), rownames(orig_feat))), "\n")
+cat("  ps vs implanted    : ", isTRUE(all.equal(rownames(ps_mat), rownames(sim_feat))), "\n")
+cat("  original vs implant: ", isTRUE(all.equal(rownames(orig_feat), rownames(sim_feat))), "\n\n")
+
+cat("Sample labels before reordering:\n")
+cat("  ps vs original_data: ", isTRUE(all.equal(colnames(ps_mat), colnames(orig_feat))), "\n")
+cat("  ps vs implanted    : ", isTRUE(all.equal(colnames(ps_mat), colnames(sim_feat))), "\n")
+cat("  original vs implant: ", isTRUE(all.equal(colnames(orig_feat), colnames(sim_feat))), "\n\n")
+
+# ---- 5. Reorder all matrices by common feature and sample names ----
+common_features <- sort(Reduce(intersect, list(
+  rownames(ps_mat), rownames(orig_feat), rownames(sim_feat)
+)))
+common_samples <- sort(Reduce(intersect, list(
+  colnames(ps_mat), colnames(orig_feat), colnames(sim_feat)
+)))
+
+ps_sub   <- ps_mat[common_features, common_samples, drop = FALSE]
+orig_sub <- orig_feat[common_features, common_samples, drop = FALSE]
+sim_sub  <- sim_feat[common_features, common_samples, drop = FALSE]
+
+cat("Dimensions after alignment:\n")
+cat("  ps        :", paste(dim(ps_sub), collapse = " x "), "\n")
+cat("  original  :", paste(dim(orig_sub), collapse = " x "), "\n")
+cat("  implanted :", paste(dim(sim_sub), collapse = " x "), "\n\n")
+
+# ---- 6. Confirm that names now match exactly after reordering ----
+cat("Feature labels after reordering:\n")
+cat("  ps vs original_data: ", isTRUE(all.equal(rownames(ps_sub), rownames(orig_sub))), "\n")
+cat("  ps vs implanted    : ", isTRUE(all.equal(rownames(ps_sub), rownames(sim_sub))), "\n")
+cat("  original vs implant: ", isTRUE(all.equal(rownames(orig_sub), rownames(sim_sub))), "\n\n")
+
+cat("Sample labels after reordering:\n")
+cat("  ps vs original_data: ", isTRUE(all.equal(colnames(ps_sub), colnames(orig_sub))), "\n")
+cat("  ps vs implanted    : ", isTRUE(all.equal(colnames(ps_sub), colnames(sim_sub))), "\n")
+cat("  original vs implant: ", isTRUE(all.equal(colnames(orig_sub), colnames(sim_sub))), "\n\n")
+
+# ---- 7. Compare matrix values ----
+cat("Matrix equality after alignment:\n")
+cat("  ps vs original_data: ", isTRUE(all.equal(ps_sub, orig_sub)), "\n")
+cat("  ps vs implanted    : ", isTRUE(all.equal(ps_sub, sim_sub)), "\n")
+cat("  original vs implant: ", isTRUE(all.equal(orig_sub, sim_sub)), "\n\n")
+
+cat("Maximum absolute difference:\n")
+cat("  ps vs original_data: ", max(abs(ps_sub - orig_sub), na.rm = TRUE), "\n")
+cat("  ps vs implanted    : ", max(abs(ps_sub - sim_sub), na.rm = TRUE), "\n")
+cat("  original vs implant: ", max(abs(orig_sub - sim_sub), na.rm = TRUE), "\n\n")
+
+# ---- 8. Optional: inspect first mismatch if values differ ----
+if (!isTRUE(all.equal(ps_sub, sim_sub))) {
+  idx <- which(ps_sub != sim_sub, arr.ind = TRUE)
+  if (nrow(idx) > 0) {
+    i <- idx[1, "row"]
+    j <- idx[1, "col"]
+    cat("First ps vs implanted mismatch:\n")
+    cat("  feature :", rownames(ps_sub)[i], "\n")
+    cat("  sample  :", colnames(ps_sub)[j], "\n")
+    cat("  ps      :", ps_sub[i, j], "\n")
+    cat("  implant :", sim_sub[i, j], "\n")
+  }
+}
+
+```
+
+Verify that the implanted markers are the only ones that changed.
+
+```{r verify-implantation-integrity, collapse=TRUE, results='hold'}
+
+g <- "ab15_prev1_rep1"
+
+# ------------------------------------------------------------
+# 1. Read original and implanted feature tables
+# ------------------------------------------------------------
+
+# original data
+orig_feat <- h5read(sim.implant, "original_data/filt_features")
+orig_feat_names <- h5read(sim.implant, "original_data/filt_feature_names")
+orig_sample_names <- h5read(sim.implant, "original_data/sample_names")
+
+rownames(orig_feat) <- orig_feat_names
+colnames(orig_feat) <- orig_sample_names
+
+# implanted group
+grp <- h5read(sim.implant, g)
+sim_feat <- grp$features
+rownames(sim_feat) <- grp$feature_names
+colnames(sim_feat) <- grp$sample_names
+
+marker_idx <- grp$marker_idx
+label <- grp$labels
+names(label) <- grp$sample_names
+
+# ------------------------------------------------------------
+# 2. Align by feature and sample names
+# ------------------------------------------------------------
+
+common_features <- sort(intersect(rownames(orig_feat), rownames(sim_feat)))
+common_samples  <- sort(intersect(colnames(orig_feat), colnames(sim_feat)))
+
+orig_sub <- orig_feat[common_features, common_samples, drop = FALSE]
+sim_sub  <- sim_feat[common_features, common_samples, drop = FALSE]
+
+label_sub <- label[common_samples]
+
+cat("Aligned dimensions:\n")
+cat("  original :", paste(dim(orig_sub), collapse = " x "), "\n")
+cat("  implanted:", paste(dim(sim_sub), collapse = " x "), "\n\n")
+
+# ------------------------------------------------------------
+# 3. Which features actually changed?
+# ------------------------------------------------------------
+
+# any count change at all in at least one sample
+changed_feature <- rowSums(orig_sub != sim_sub, na.rm = TRUE) > 0
+changed_features <- rownames(orig_sub)[changed_feature]
+
+cat("Features listed in marker_idx      :", length(marker_idx), "\n")
+cat("Features with any observed change  :", length(changed_features), "\n")
+cat("Intersection(marker_idx, changed)  :", length(intersect(marker_idx, changed_features)), "\n")
+cat("Markers with no observed change    :", length(setdiff(marker_idx, changed_features)), "\n")
+cat("Changed but not in marker_idx      :", length(setdiff(changed_features, marker_idx)), "\n\n")
+
+# show examples if something looks wrong
+cat("First marker_idx entries:\n")
+print(head(sort(marker_idx), 10))
+
+cat("\nFirst changed features:\n")
+print(head(sort(changed_features), 10))
+
+cat("\nMarkers with no observed change:\n")
+print(head(setdiff(marker_idx, changed_features), 10))
+
+cat("\nChanged but not in marker_idx:\n")
+print(head(setdiff(changed_features, marker_idx), 10))
+
+# ------------------------------------------------------------
+# 4. Summarize per-feature change magnitude
+# ------------------------------------------------------------
+
+qc_df <- tibble(
+  feature = rownames(orig_sub),
+  is_marker = rownames(orig_sub) %in% marker_idx,
+  n_changed_samples = rowSums(orig_sub != sim_sub, na.rm = TRUE),
+  mean_abs_diff = rowMeans(abs(sim_sub - orig_sub), na.rm = TRUE),
+  sum_abs_diff = rowSums(abs(sim_sub - orig_sub), na.rm = TRUE),
+  prevalence_orig = rowMeans(orig_sub > 0, na.rm = TRUE),
+  prevalence_sim  = rowMeans(sim_sub > 0, na.rm = TRUE)
+) %>%
+  arrange(desc(sum_abs_diff), desc(n_changed_samples))
+
+cat("\nTop features by total absolute change:\n")
+print(qc_df %>% select(feature, is_marker, n_changed_samples, sum_abs_diff, mean_abs_diff) %>% head(20))
+
+# ------------------------------------------------------------
+# 5. Check expected class separation among markers
+# ------------------------------------------------------------
+
+# compare mean relative abundance by class before and after implantation
+orig_rel <- sweep(orig_sub, 2, colSums(orig_sub), FUN = "/")
+sim_rel  <- sweep(sim_sub, 2, colSums(sim_sub), FUN = "/")
+
+pos_samples <- names(label_sub)[label_sub == 1]
+neg_samples <- names(label_sub)[label_sub == -1]
+
+marker_effect_df <- tibble(
+  feature = marker_idx[marker_idx %in% rownames(sim_rel)],
+  orig_mean_pos = rowMeans(orig_rel[marker_idx[marker_idx %in% rownames(sim_rel)], pos_samples, drop = FALSE], na.rm = TRUE),
+  orig_mean_neg = rowMeans(orig_rel[marker_idx[marker_idx %in% rownames(sim_rel)], neg_samples, drop = FALSE], na.rm = TRUE),
+  sim_mean_pos  = rowMeans(sim_rel [marker_idx[marker_idx %in% rownames(sim_rel)], pos_samples, drop = FALSE], na.rm = TRUE),
+  sim_mean_neg  = rowMeans(sim_rel [marker_idx[marker_idx %in% rownames(sim_rel)], neg_samples, drop = FALSE], na.rm = TRUE)
+) %>%
+  mutate(
+    orig_diff = orig_mean_pos - orig_mean_neg,
+    # true implanted separation after simulation
+    sim_diff  = sim_mean_pos - sim_mean_neg,
+    abs_sim_diff = abs(sim_diff)
+  ) %>%
+  arrange(desc(abs_sim_diff))
+
+cat("\nTop implanted markers by absolute class separation after implantation:\n")
+print(marker_effect_df %>% select(feature, sim_mean_pos, sim_mean_neg, sim_diff, abs_sim_diff) %>% head(20))
+
+# ------------------------------------------------------------
+# 6. Quick pass/fail summary
+# ------------------------------------------------------------
+
+all_markers_changed <- setequal(intersect(marker_idx, rownames(orig_sub)), intersect(marker_idx, changed_features))
+no_nonmarkers_changed <- length(setdiff(changed_features, marker_idx)) == 0
+
+cat("\nQC flags:\n")
+cat("  all markers changed at least somewhere : ", all_markers_changed, "\n")
+cat("  no non-marker changed                  : ", no_nonmarkers_changed, "\n")
+```
+
+Verify that running the `apply.test()` function from SIMBA still works as expected. Nothing should be detected because we are testing `ab.scale=1` here.
+
+```{r verify-eval-integrity, collapse=TRUE, results='hold'}
+
+alpha <- 0.05
+rep_col <- "rep_1"
+
+g <- "ab1_prev1_rep1"
+subset_name <- "subset_261"
+
+grp <- rhdf5::h5read(sim.implant, g)
+marker_idx_h5 <- grp$marker_idx
+
+res <- apply.test(
+  sim.location = sim.implant,
+  group = g,
+  subset = 261,
+  norm = "pass",
+  test = "LinDA",
+  covariates = c("Age")
+)
+
+pval_mat <- res[["p.val"]][[g]][[subset_name]]
+head(rownames(pval_mat))
+eff_mat <- res[["eff.size"]][[g]][[subset_name]]
+eff <- eff_mat[, rep_col]
+
+sum(marker_idx_h5 %in% rownames(pval_mat))
+setdiff(marker_idx_h5, rownames(pval_mat))
+
+p <- pval_mat[, rep_col]
+padj <- p.adjust(p, method = "fdr")
+res_df <- data.frame(feature=names(eff), pval=p, padj=padj, effect_size=eff)
+
+detected <- names(padj)[padj < alpha]
+
+cat("Detected taxa:", length(detected), "\n")
+cat("True markers:", length(marker_idx_h5), "\n")
+cat("True positives:", sum(detected %in% marker_idx_h5), "\n")
+cat("False positives:", sum(!detected %in% marker_idx_h5), "\n")
+cat("Manual power:", mean(marker_idx_h5 %in% detected), "\n")
+
+```
+
+# Prepare the benchmark groups
+
+SIMBA stores one HDF5 group per simulation setting. The chunks below identify all groups and restrict the analysis to the intended number of simulation repeats.
+
+```{r prepare-groups}
+temp <- rhdf5::h5ls(sim.implant, recursive = FALSE)
+groups <- setdiff(temp$name, c("original_data", "simulation_parameters"))
+
+# Keep abundance-scale groups with the single prevalence setting used here.
+groups.sub <- groups[grepl("^ab[0-9]+_prev1_rep[0-9]+$", groups)]
+
+# Restrict to the requested number of simulation repeats.
+groups.sub <- groups.sub[
+  as.integer(stringr::str_match(groups.sub, "^ab[0-9]+_prev1_rep([0-9]+)$")[, 2]) <= REPS_USED
+]
+
+rm(temp, groups)
+```
+
+# Benchmark multiple differential abundance methods
+
+The benchmark runs one method at a time across all simulated groups and then aggregates performance metrics across repeats.
+
+## Run the benchmark
+
+The normalization strategy is chosen separately for each method. Calibration tables are also extracted where available, as they are needed later for detectability-boundary analyses.
+
+```{r benchmark-many-methods, message=FALSE, warning=FALSE, results='hide'}
+
+test_names <- c(
+  "LinDA",
+  "metagenomeSeq", 
+  "ANCOMBC2", "ANCOMBC",
+  "DESeq2", "lm", "edgeR"
+)
+  
+force_DA_tests <- FALSE
+filename = file.path(simh5.loc, paste0("BC_", param_set, "_eval_summary.rds"))
+if (!file.exists(filename) || force_DA_tests) {
+  
+  # Modify this 
+  n_workers <- n_cpus
+  
+  if (n_workers > 1) {
+    future::plan(future::multisession, workers = n_workers)
+  } else {
+    future::plan("sequential")
+  }
+  
+  method_results_BC <- test_names %>%
+    set_names() %>%
+    purrr::map(function(test_name) {
+      # Method-specific normalization
+      norm_method <- dplyr::case_when(
+        test_name == "lm" ~ "clr_halfmin",
+        test_name == "wilcoxon" ~ "TSS",
+        test_name == "LinDA" ~ "TSS",
+        TRUE ~ "pass"
+      )
+      
+      # Covariate adjustment where relevant
+      covariates <- NULL
+      if (test_name %in% c("LinDA", "metagenomeSeq", "lm", "ANCOMBC", "ANCOMBC2", "DESeq2", "edgeR")) {
+        covariates <- c("Age")
+      }
+      
+      # Some methods do not currently return effect sizes in the patched workflow
+      return_calib <- TRUE
+      
+      simbaR::run_method_eval_parallel(
+        test_name = test_name,
+        groups.sub = groups.sub,
+        sim.implant = sim.implant,
+        subset_size = subset_size,
+        ab.scale = ab.scale,
+        alpha = ALPHA,
+        norm = norm_method,
+        covariates = covariates,
+        seed = TRUE,
+        show_progress = TRUE,
+        simba.loc = NULL,
+        return_calib = return_calib
+      )
+    })
+  saveRDS(method_results_BC, file = filename)
+} else {
+  method_results_BC <- readRDS(file = filename)
+}
+
+```
+
+
+## Summarize benchmark performance
+
+```{r benchmark-summary}
+master_evals_BC <- dplyr::bind_rows(purrr::map(method_results_BC, "evals"))
+
+power_combined_benchmark_BC <- master_evals_BC %>%
+  group_by(test, ab_scale, prev_index) %>%
+  summarise(
+    mean_power = mean(power, na.rm = TRUE),
+    sd_power = sd(power, na.rm = TRUE),
+    mean_fdr = mean(empirical_fdr, na.rm = TRUE),
+    sd_fdr = sd(empirical_fdr, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_auroc = mean(auroc, na.rm = TRUE),
+    mean_abs_eff_tp2 = mean(mean_abs_eff_tp, na.rm = TRUE),
+    sd_abs_eff_tp = sd(mean_abs_eff_tp, na.rm = TRUE),
+    mean_abs_eff_marker2 = mean(mean_abs_eff_marker, na.rm = TRUE),
+    sd_abs_eff_marker = sd(mean_abs_eff_marker, na.rm = TRUE),
+    n_reps = n(),
+    .groups = "drop"
+  )
+
+datatable(power_combined_benchmark_BC)
+```
+
+## Visualize benchmark performance
+
+These plots provide the benchmark overview used to select methods for the downstream detectability analyses.
+
+```{r benchmark-viz, fig.width=8, fig.height=10}
+plot_df <- power_combined_benchmark_BC %>%
+  filter(test %in% test_names) %>%
+  mutate(test = factor(test, levels = test_names))
+
+p_fdr <- ggplot(plot_df, aes(x = ab_scale, y = mean_fdr, color = test, group = test)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(0, mean_fdr - sd_fdr),
+      ymax = pmin(1, mean_fdr + sd_fdr)
+    ),
+    width = 0.08,
+    alpha = 0.6
+  ) +
+  #geom_hline(yintercept = ALPHA, linetype = 2) +
+  geom_hline(yintercept = 0.20, linetype = 2) +
+  scale_x_continuous(limits = c(0.5, 10), breaks = seq(1, 10)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Implanted effect size",
+    y = "FDR",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+p_power <- ggplot(plot_df, aes(x = ab_scale, y = mean_power, color = test, group = test)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(0, mean_power - sd_power),
+      ymax = pmin(1, mean_power + sd_power)
+    ),
+    width = 0.08,
+    alpha = 0.6
+  ) +
+  geom_hline(yintercept = 0.75, linetype = 2) +
+  #geom_hline(yintercept = 0.4, linetype = 2) +
+  scale_x_continuous(limits = c(0.5, 10), breaks = seq(1, 10)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Implanted effect size",
+    y = "Power",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+BC_summary_plot <- ((p_power + labs(tag = "a")) / (p_fdr + labs(tag = "b"))) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    plot.tag = element_text(size = 20, face = "bold")
+  )
+
+BC_summary_plot
+
+ggsave(filename = file.path(out.loc, paste0("BC_", param_set, "_summary.pdf")), 
+       plot = BC_summary_plot,
+       device = cairo_pdf,
+       width = 8,
+       height = 10)
+ggsave(filename = file.path(out.loc, paste0("BC_", param_set, "_power.pdf")), plot = p_power, width = 8, height = 5)
+ggsave(filename = file.path(out.loc, paste0("BC_", param_set, "_fdr.pdf")), plot = p_fdr, width = 8, height = 5)
+```
+
+# Build the calibration table
+
+The calibration analysis uses method-specific p-values and effect sizes extracted from the benchmarked simulations.
+
+```{r calibration-analysis}
+master_calib_BC <- dplyr::bind_rows(purrr::map(method_results_BC, "calib_df")) %>%
+  mutate(
+    detected = as.logical(padj < ALPHA),
+    is_tp = as.logical(detected & is_marker),
+    is_fp = as.logical(detected & !is_marker)
+  )
+```
+
+```{r debug, eval=FALSE, include=FALSE}
+
+# Read from HDF5
+
+xgrp <- rhdf5::h5read(sim.implant, "ab1_prev1_rep1")
+xfeat <- xgrp$features
+rownames(xfeat) <- xgrp$feature_names
+colnames(xfeat) <- xgrp$sample_names
+
+xmeta <- rhdf5::h5read(sim.implant, "original_data/metadata")
+xmeta <- as.data.frame(xmeta, stringsAsFactors = FALSE)
+rownames(xmeta) <- xmeta[["__sample_id"]]
+xmeta["__sample_id"] <- NULL
+newlabel <- xmeta$DiseaseStatus.binary
+newlabel[newlabel == 1] <- -1
+newlabel[newlabel == 2] <- 1
+xmeta$DiseaseStatus.binary <- newlabel
+
+isTRUE(all.equal(colnames(xfeat), rownames(xmeta)))
+
+xotu <- "ext_mOTU_v3_17336"
+
+y <- feat[xotu, rownames(xmeta)]
+predf <- cbind(meta, raw = as.numeric(y))
+
+y[y==0] <- 0.5
+y <- clr(y)
+
+xdf <- cbind(xmeta, x = as.numeric(y))
+
+xfit <- lm(x ~ DiseaseStatus.binary + Age, data = xdf)
+broom::tidy(xfit)
+
+# Test from phyloseq
+
+tab_analysis <- as(otu_table(ps2), "matrix")
+#tab_analysis <- tab_analysis[, rownames(meta)]
+tab_analysis[tab_analysis == 0] <- 0.5
+tab_analysis <- as.data.frame(apply(tab_analysis, 1, compositions::clr))
+ydf = cbind(xmeta, y=as.numeric(tab_analysis[,"ext_mOTU_v3_17336"]))
+yfit <- lm(y ~ DiseaseStatus.binary + Age, data = ydf)
+broom::tidy(yfit)
+
+
+zdf <- inner_join(inner_join(predf, xdf), ydf)
+
+```
+
+
+# Select methods for interpretability analysis
+
+Only methods that jointly satisfy the chosen benchmark criteria are carried forward into the detectability-boundary plots. We have relaxed the criteria to be: above 40% power and below 15% FDR.
+
+```{r select-methods}
+good_ones <- power_combined_benchmark_BC %>%
+  filter(mean_power >= 0.75 & mean_fdr <= 0.20) %>%
+  group_by(test) %>%
+  filter(rank(ab_scale, ties.method = "first") == 1) %>%
+  arrange(ab_scale, test)
+datatable(good_ones)
+
+methods_keep <- sort(good_ones$test)
+methods_keep
+```
+
+# Run the real-data differential abundance analyses
+
+The next step is to run the corresponding differential abundance methods on the real breast cancer case/control data. These results are then compared with the simulation-derived detectability boundaries.
+
+```{r real-data-DA-analysis, message=FALSE, warning=FALSE, results='hide'}
+
+# prepare the tables
+ps2 <- filter_taxa_by_prevalence(ps, MIN_DISCOVERY_PREVALENCE)
+ps2rel <- transform_sample_counts(ps2, function(x) x / sum(x))
+real_feat_relab <- as(otu_table(ps2rel), "matrix")
+real_feat_relab <- as.data.frame(real_feat_relab[, rownames(meta)])
+
+# Run DA test on real data
+
+force_DA_tests <- FALSE
+
+param_set2 <- paste("alpha", ALPHA, "prev", MIN_DISCOVERY_PREVALENCE, "reps", REPS_USED, sep = "_")
+filename = file.path(simh5.loc, paste0("BC_", param_set2, "_real_data.rds"))
+
+if (!file.exists(filename) || force_DA_tests) {
+  
+  # DESeq2
+  
+  sample_data(ps2)[["DiseaseStatus.binary"]] <- factor(sample_data(ps2)[["DiseaseStatus.binary"]],
+                                                       levels=c(1,2),
+                                                       ordered=FALSE)
+  DES = phyloseq_to_deseq2(ps2, as.formula("~ Age + DiseaseStatus.binary"))
+  dds <- estimateSizeFactors(DES, type = "poscounts")
+  dds <- DESeq(dds,
+               fitType = "parametric",
+               test = "Wald",
+               quiet = TRUE,
+               minReplicatesForReplace = Inf
+  )
+  res_DESeq2 <- as.data.frame(results(dds, contrast = c("DiseaseStatus.binary", c(1, 2)), cooksCutoff = TRUE))
+  
+  # Encode as 1/2 as 0/1
+  
+  meta$DiseaseStatus.binary <- meta$DiseaseStatus.binary - 1
+  sample_data(ps2) <- meta
+  
+  # ANCOMBC2
+  res_ancombc2 <- ancombc2(
+    data = ps2,
+    fix_formula = "DiseaseStatus.binary + Age",
+    rand_formula = NULL,
+    p_adj_method = "fdr",
+    prv_cut = MIN_DISCOVERY_PREVALENCE,
+    lib_cut = 1000,
+    alpha = ALPHA
+  )
+  # Filter for sensitivity analysis
+  res_ancombc2$res <- res_ancombc2$res %>%
+    dplyr::mutate(p_DiseaseStatus.binary = replace(p_DiseaseStatus.binary, passed_ss_DiseaseStatus.binary != TRUE, 1))
+  
+  # ANCOMBC
+  res_ancombc <- ancombc(
+    data = ps2,
+    formula = "DiseaseStatus.binary + Age",
+    p_adj_method = "fdr",
+    pseudo = 1,
+    prv_cut = MIN_DISCOVERY_PREVALENCE,
+    lib_cut = 1000
+  )
+  
+  # Re-encode 0/1 as -1/+1
+  newlabel <- as.numeric(meta$DiseaseStatus.binary)
+  newlabel[newlabel == 0] <- -1
+  # newlabel[newlabel == 1] <- 1
+  meta$DiseaseStatus.binary <- newlabel
+  
+  # lm on clr-transformed abundance with a half-minimum pseudocount
+  tab_analysis <- as(otu_table(ps2), "matrix")
+  pseudo <- min(tab_analysis[tab_analysis > 0]) / 2
+  tab_analysis[tab_analysis == 0] <- pseudo
+  tab_analysis <- as.data.frame(apply(tab_analysis, 1, compositions::clr))
+  
+  fit_one <- function(y, meta) {
+    d <- cbind(meta, y = as.numeric(y))
+    fit <- lm(y ~ DiseaseStatus.binary + Age, data = d)
+    res <- broom.mixed::tidy(fit, effects = "fixed")
+    res[res$term == "DiseaseStatus.binary", ]
+  }
+  
+  res_lm <- apply(tab_analysis, MARGIN=2, FUN = fit_one, meta = meta) %>%
+    bind_rows(.id = "OTU") %>%
+    mutate(padj = p.adjust(p.value, method = "fdr"))
+  
+  # LinDA on relative abundance
+  
+  meta$DiseaseStatus.binary = factor(meta$DiseaseStatus.binary, levels=c(-1, 1))
+  res_linda <- LinDA::linda(
+    real_feat_relab,
+    meta,
+    formula = "~ DiseaseStatus.binary + Age",
+    alpha = ALPHA,
+    p.adj.method = "BH",
+    type = "proportion"
+  )
+  
+  # metagenomeSeq
+  
+  sample_data(ps2) <- meta # take the version with factors and -1/+1
+  
+  m <- phyloseq_to_metagenomeSeq(ps2)
+  m2 <- filterData(m, present = nsamples(ps2) * MIN_DISCOVERY_PREVALENCE, depth = 1000)
+  p <- cumNormStat(m2)
+  m2 <- cumNorm(m2, p = p)
+  pd <- pData(m2)
+  
+  mod1 <- model.matrix(~ DiseaseStatus.binary + Age, data = pd)
+  res1 <- fitZig(m2, mod1, control = zigControl(maxit = 20, verbose = FALSE))
+  res_metagenomeSeq <- MRcoefs(res1, number = nrow(res1), adjustMethod = "fdr")
+  
+  
+  # Store raw p-values and effect sizes for downstream interpretability analyses
+  p_lm_real <- as.numeric(res_lm$p.value)
+  eff_lm_real <- as.numeric(res_lm$estimate)
+  p_linda_real = res_linda$output$DiseaseStatus.binary$pvalue
+  eff_linda_real = res_linda$output$DiseaseStatus.binary$log2FoldChange
+  p_mgs_real <- res_metagenomeSeq$pvalues
+  eff_mgs_real <- res_metagenomeSeq$DiseaseStatus.binary1
+  p_ancombc_real <- res_ancombc$res$p_val$DiseaseStatus.binary
+  eff_ancombc_real <- res_ancombc$res$lfc$DiseaseStatus.binary
+  p_ancombc2_real <- res_ancombc2$res$p_DiseaseStatus.binary
+  eff_ancombc2_real <- res_ancombc2$res$lfc_DiseaseStatus.binary
+  
+  p_deseq2_real = res_DESeq2$pvalue
+  eff_deseq2_real = res_DESeq2$log2FoldChange
+  
+  
+  names(p_lm_real) <- rownames(real_feat_relab)
+  names(eff_lm_real) <- rownames(real_feat_relab)
+  names(p_linda_real) <- rownames(real_feat_relab)
+  names(eff_linda_real) <- rownames(real_feat_relab)
+  names(p_mgs_real) <- rownames(real_feat_relab)
+  names(eff_mgs_real) <- rownames(real_feat_relab)
+  names(p_ancombc_real) <- rownames(real_feat_relab)
+  names(eff_ancombc_real) <- rownames(real_feat_relab)
+  names(p_ancombc2_real) <- res_ancombc2$res$taxon
+  names(eff_ancombc2_real) <- res_ancombc2$res$taxon
+  names(p_deseq2_real) <- rownames(real_feat_relab)
+  names(eff_deseq2_real) <- rownames(real_feat_relab)
+  
+  real_results_BC <- list(
+    DESeq2 = list(pval = p_deseq2_real, eff = eff_deseq2_real),
+    lm = list(pval = p_lm_real, eff = eff_lm_real),
+    LinDA = list(pval = p_linda_real, eff = eff_linda_real),
+    ANCOMBC = list(pval = p_ancombc_real, eff = eff_ancombc_real),
+    ANCOMBC2 = list(pval = p_ancombc2_real, eff = eff_ancombc2_real),
+    metagenomeSeq = list(pval = p_mgs_real, eff = eff_mgs_real)
+  )
+  
+  saveRDS(real_results_BC, file = filename)
+} else {
+  real_results_BC <- readRDS(file = filename)
+}
+
+```
+
+
+```{r debug-linda, include=FALSE, eval=FALSE}
+ps_rds <- "/projects/arumugam/people/xhf865/Camila/BreastCancer/phyloseq/ps.motus_raw.3.0.3.rds"
+ps_orig <- readRDS(ps_rds)
+ps <- filter_taxa_by_prevalence(ps_orig, MIN_DISCOVERY_PREVALENCE)
+ps
+
+meta <- sample_data(ps) %>%
+  unclass() %>%
+  as.data.frame() %>%
+  select(participant_id,
+         DNA_ID,
+         DiseaseStatus.binary,
+         Age
+         )
+meta$Individual_ID <- as.character(meta$participant_id)
+meta$participant_id <- NULL
+meta$DiseaseStatus.binary <- as.numeric(meta$DiseaseStatus.binary)
+meta$Timepoint <- 1
+rownames(meta) <- meta$DNA_ID
+meta$DNA_ID <- NULL
+
+sample_data(ps) <- meta
+
+ps2 <- transform_sample_counts(ps, function(x) x / sum(x))
+ps2
+meta <- as(sample_data(ps2), "data.frame")
+meta$DiseaseStatus.binary[meta$DiseaseStatus.binary == 0] = -1
+meta$DiseaseStatus.binary[meta$DiseaseStatus.binary == 1] = 1
+meta$DiseaseStatus.binary[meta$DiseaseStatus.binary == -1] = 0
+meta$DiseaseStatus.binary = as.numeric(meta$DiseaseStatus.binary)
+tab_analysis <- as(otu_table(ps2), "matrix")
+tab_analysis <- tab_analysis[, rownames(meta)]
+res_linda <- LinDA::linda(
+  tab_analysis,
+  meta,
+  formula = "~ DiseaseStatus.binary + Age",
+  alpha = ALPHA,
+  p.adj.method = "BH",
+  type = "proportion"
+)
+res_linda$output$DiseaseStatus.binary["meta_mOTU_v3_12389",]
+```
+
+# Build the abundance-stratified detectability analysis
+
+```{r detectability-modeling}
+
+force_boundary_modeling <- FALSE
+
+param_set2 <- paste("alpha", ALPHA, "prev", MIN_DISCOVERY_PREVALENCE, "reps", REPS_USED, sep = "_")
+filename = file.path(simh5.loc, paste0("BC_", param_set2, "_detectability_modeling.rds"))
+
+if (!file.exists(filename) || force_boundary_modeling) {
+  detectability_model_res <- compare_detectability_models_aic_cv(
+    master_calib = master_calib_BC %>% filter(ab_scale > 1),
+    methods = c("ANCOMBC", "ANCOMBC2", "LinDA", "lm"),
+    target_col = "detected",
+    good_col = "is_tp",
+    model_type = "nonlinear"
+  )
+  saveRDS(detectability_model_res, file = filename)
+} else {
+  detectability_model_res <- readRDS(file = filename)
+}
+
+datatable(detectability_model_res$aic_long)
+datatable(detectability_model_res$best_model_aic)
+datatable(detectability_model_res$cv_summary_auc)
+datatable(detectability_model_res$best_model_auroc)
+datatable(detectability_model_res$best_model_auprc)
+
+```
+
+
+## Plot the real analysis results against abundance-stratified predictability boundaries
+
+The plots below places taxa from real data against the simulation-derived 80% detection barrier.
+
+```{r estimate-detection-thresholds-abundance}
+real_prevalence <- rowMeans(feat > 0)
+
+res_bound_abund_BC <- run_casecontrol_upper_bound_abundance(
+  master_calib = master_calib_BC %>% dplyr::filter(ab_scale > 1),
+  feat_real = real_feat_relab,
+  methods = methods_keep,
+  real_results_list = real_results_BC,
+  analysis_subset_col = "is_marker",
+  response_col = "detected",
+  prevalence = real_prevalence,
+  target_prob = 0.8,
+  adjust = "fdr",
+  alpha = 0.20,
+  #formula = good_bin ~ te(effect, prevalence, k = c(3, 4)) + s(abundance, k = 4, bs = "ts")
+  formula = good_bin ~
+        s(effect, k = 4, bs = "ts") +
+        s(prevalence, k = 4, bs = "ts") +
+        s(abundance, k = 4, bs = "ts")
+)
+```
+
+Let's visualize whether real data effect sizes are entering the detectable regions.
+
+```{r plot-detection-thresholds, fig.width=8, fig.height=11}
+p_bound_BC_model <- plot_effect_size_upper_bounds_abundance(
+  res_bound = res_bound_abund_BC,
+  methods = methods_keep
+)
+p_bound_BC_model
+ggsave(
+  filename = file.path(out.loc, paste0("BC_", param_set, "_eff_size_boundaries_real.pdf")),
+  plot = p_bound_BC_model,
+  device = cairo_pdf,
+  width = 8,
+  height = 9
+)
+```
+
+Now let's visualize this together with the corresponding p-values, to put the ones crossing the boundary in context.
+
+```{r plot-detection-thresholds-pval, fig.width=8, fig.height=11}
+miami_width = 8
+miami_height = 11
+p_pseudomiami_BC <- plot_pseudomiami_detectability_abundance(
+  res_bound = res_bound_abund_BC,
+  methods = methods_keep,
+  pval_ymax = 4,
+  top_fraction = 0.5,
+  gap_fraction = 0.05,
+  figure_width = miami_width,
+  figure_height = miami_height,
+  failed_label = "Species failing the association test",
+  positive_label = "Positive taxon",
+  boundary_label = "80% detectability boundary",
+  annotation_method = "ANCOMBC2",
+  annotation_stratum = "High",
+  annotation_x_lower = 0.8,
+  annotation_x_upper = 0.4,
+  annotation_angle = 20
+)
+p_pseudomiami_BC
+ggsave(
+  filename = file.path(out.loc, paste0("BC_", param_set, "_pseudo_miami.pdf")),
+  plot = p_pseudomiami_BC,
+  device = cairo_pdf,
+  width = miami_width,
+  height = miami_height
+)
+```
+
+
+```{r knitting, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "BC_detectability_analysis.Rmd",
+  output_file = "BC_detectability_analysis.publish.html",
+  output_dir = "."
+)
+```
+
+# Session information
+
+Session information is printed below to document package versions and the computational environment used for the analysis.
+
+```{r session-info}
+sessionInfo()
+```
