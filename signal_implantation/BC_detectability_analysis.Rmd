@@ -1131,7 +1131,6 @@ res_bound_abund_BC <- run_casecontrol_upper_bound_abundance(
   target_prob = 0.8,
   adjust = "fdr",
   alpha = 0.20,
-  #formula = good_bin ~ te(effect, prevalence, k = c(3, 4)) + s(abundance, k = 4, bs = "ts")
   formula = good_bin ~
         s(effect, k = 4, bs = "ts") +
         s(prevalence, k = 4, bs = "ts") +
