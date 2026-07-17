@@ -1,5 +1,9 @@
 # A. Differential Abundance Pipeline: `DAA_function()`
 
+**Author:** Camila Alvarez-Silva  
+
+---
+
 **Purpose:** Multi-method differential abundance (DA) analysis of microbiome count/TPM data stored as `phyloseq` objects, with automatic consensus calling across methods.
 
 ---
@@ -189,8 +193,22 @@ results <- run_da_pipeline(
 
 - `log2FC` from LMM reflects the **CLR-scale regression coefficient** for the variable of interest, not a true log2 fold-change. Interpret accordingly when comparing across methods.
 
+# B. Signal-implantation benchmarking and background distribution simulations using SIMBA
 
-# B. Sutterellaceae Relapse & Survival Analysis : `sutterellaceae_survival_analysis.R`
+**Author:** Mani Arumugam
+
+---
+
+## Case-control analysis:
+ - [R markdown source](signal_implantation/BC_detectability_analysis.Rmd) for the workflow for signal-implantation for case-control biomarkers.
+ - [Knitted HTML document](https://arumugamlab.github.io/breast_cancer_microbiome/BC_detectability_analysis.html) with the results and figures used in the manuscript.
+
+## Recurrence analysis:
+ - [R markdown source](signal_implantation/Relapse_detectability_analysis.Rmd) for the workflow for signal-implantation for recurrence biomarkers and shuffled-label background distribution.
+ - [Knitted HTML document](https://arumugamlab.github.io/breast_cancer_microbiome/Relapse_detectability_analysis.html) with the results and figures used in the manuscript.
+
+
+# C. Relapse & Survival Analysis for Sutterellaceae species mOTU `meta_mOTU_v3_12389` : `sutterellaceae_survival_analysis.R`
 
 **Author:** Camila Alvarez-Silva  
 
