@@ -2,11 +2,9 @@
 
 **Author:** Camila Alvarez-Silva  
 
----
+## Purpose
 
-**Purpose:** Multi-method differential abundance (DA) analysis of microbiome count/TPM data stored as `phyloseq` objects, with automatic consensus calling across methods.
-
----
+Multi-method differential abundance (DA) analysis of microbiome count/TPM data stored as `phyloseq` objects, with automatic consensus calling across methods.
 
 ## Overview
 
@@ -30,8 +28,6 @@ ps_list (named list of phyloseq objects)
                 └─► consensus_features.csv      (cross-method agreement)
 ```
 
----
-
 ## Dependencies
 
 Install all packages before running. Bioconductor packages require `BiocManager`.
@@ -54,8 +50,6 @@ BiocManager::install(c("phyloseq", "MicrobiomeStat", "ANCOMBC", "LinDA"))
 | broom.mixed | ≥ 0.2 | Tidy model output |
 | tidyverse | ≥ 2.0 | Data wrangling |
 
----
-
 ## Input
 
 ### `ps_list` — Named list of phyloseq objects
@@ -76,10 +70,8 @@ ps_list <- list(
   KEGG_KO       = FA.KEGG_KO 
 )
 ```
-
+> [!NOTE]
 > **Dataset type matters:** datasets  named `"Taxonomy"` receive the full three-method suite (LinDA + ANCOMBC2 + LMM). All other names (Functional profiles, TPM normalized) receive LinDA + LMM only.
-
----
 
 ### `run_da_pipeline()` — Master function arguments
 
@@ -108,8 +100,6 @@ results <- run_da_pipeline(
 )
 ```
 
----
-
 ### Required columns in `sample_data`
 
 | Column | Used when | Description |
@@ -121,8 +111,6 @@ results <- run_da_pipeline(
 | `ki67_ihc` | `filterCondition = TRUE` | Must be non-missing |
 | `ln_tumorpositive.binary` | `filterCondition = TRUE` | Must be non-missing |
 | `tumor_size` | `filterCondition = TRUE` | Must be non-missing |
-
----
 
 ## Methods
 
@@ -139,8 +127,6 @@ results <- run_da_pipeline(
 | LinDA | Relative abundance (`Taxonomy` dataset only) | Proportion normalisation before LinDA |
 | ANCOMBC2 | Internal (bias-correction) | Handles compositional bias natively |
 | LM / LMM | CLR (centred log-ratio) after pseudo-count | Standard compositional approach |
-
----
 
 ## Output
 
@@ -186,18 +172,14 @@ results <- run_da_pipeline(
 | `significant_all_methods.csv` | All significant features across datasets and methods |
 | `consensus_features.csv` | Cross-method consensus summary |
 
+> [!NOTE]
+> `log2FC` from LMM reflects the **CLR-scale regression coefficient** for the variable of interest, not a true log2 fold-change. Interpret accordingly when comparing across methods.
 
 ---
-
-## Note
-
-- `log2FC` from LMM reflects the **CLR-scale regression coefficient** for the variable of interest, not a true log2 fold-change. Interpret accordingly when comparing across methods.
 
 # B. Signal-implantation benchmarking and background distribution simulations using SIMBA
 
 **Author:** Mani Arumugam
-
----
 
 ## Case-control analysis:
  - [R markdown source](signal_implantation/BC_detectability_analysis.Rmd) for the workflow for signal-implantation for case-control biomarkers.
@@ -207,12 +189,11 @@ results <- run_da_pipeline(
  - [R markdown source](signal_implantation/Relapse_detectability_analysis.Rmd) for the workflow for signal-implantation for recurrence biomarkers and shuffled-label background distribution.
  - [Knitted HTML document](https://arumugamlab.github.io/breast_cancer_microbiome/Relapse_detectability_analysis.html) with the results and figures used in the manuscript.
 
+---
 
 # C. Relapse & Survival Analysis for Sutterellaceae species mOTU `meta_mOTU_v3_12389` : `sutterellaceae_survival_analysis.R`
 
 **Author:** Camila Alvarez-Silva  
-
----
 
 ## Overview
 
@@ -220,8 +201,6 @@ This script investigates the association between gut *Sutterellaceae* species mO
 
 1. **Logistic regression** — odds ratios (OR) for relapse, using both binary (presence/absence) and continuous (CLR-transformed) abundance.
 2. **Survival analysis** — Cox proportional hazards models and a Kaplan–Meier curve for recurrence-free survival stratified by *Sutterellaceae* species mOTU `meta_mOTU_v3_12389` presence.
-
----
 
 ## Analysis workflow
 
@@ -250,8 +229,6 @@ OTU matrix (samples × features)
                   └─► Cox model 2
 ```
 
----
-
 ## Dependencies
 
 ```r
@@ -259,8 +236,6 @@ install.packages(c("readxl", "dplyr", "survival", "survminer"))
 BiocManager::install("phyloseq")
 install.packages("compositions")   # for clr()
 ```
-
----
 
 ## Input files
 
@@ -307,8 +282,6 @@ A `phyloseq` object built from mOTUs v3.0.3.
 | `ki67_ihc` | Ki-67 proliferation index (covariate) |
 | `ln_tumorpositive.binary` | Lymph-node positivity binary flag (covariate) |
 
----
-
 ## Sample & feature filtering
 
 | Step | Criterion | Rationale |
@@ -317,8 +290,6 @@ A `phyloseq` object built from mOTUs v3.0.3.
 | Complete cases | Non-missing in `relapse`, `bmi_calculated`, `ki67_ihc`, `ln_tumorpositive.binary`| Ensures no missing covariates for models |
 | Prune zero taxa | `taxa_sums > 0` | Remove taxa absent after sample filtering |
 | Prevalence filter | Present in ≥ 10 % of remaining samples | Removes sparse features that inflate testing burden |
-
----
 
 ## Methods
 
@@ -351,8 +322,6 @@ time = date_lookup  − enrolment        (if censored)
 **Cox models** — identical covariate structure to logistic models, fitted with `coxph()`.
 
 **Kaplan–Meier** — `survfit()` stratified by `Sutterellaceae_bin`, plotted with `ggsurvplot()` including a log-rank p-value.
-
----
 
 ## Output
 
