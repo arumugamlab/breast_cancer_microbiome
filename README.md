@@ -16,9 +16,7 @@ ps_list (named list of phyloseq objects)
         │
         ├─► LinDA          (all dataset types)
         ├─► LM / LMM       (all dataset types)
-        ├─► ANCOMBC2       (Taxonomy only)
-        ├─► edgeR          (Taxonomy only)
-        └─► metagenomeSeq  (Taxonomy only)
+        └─► ANCOMBC2       (Taxonomy only)
                 │
                 ▼
         Harmonised results table
@@ -40,8 +38,7 @@ install.packages(c("tidyverse", "ggplot2", "ggrepel", "patchwork",
                    "lme4", "lmerTest", "broom.mixed"))
 
 # Bioconductor
-BiocManager::install(c("phyloseq", "MicrobiomeStat", "ANCOMBC",
-                       "edgeR", "metagenomeSeq", "LinDA"))
+BiocManager::install(c("phyloseq", "MicrobiomeStat", "ANCOMBC", "LinDA"))
 ```
 
 | Package | Version tested | Role |
@@ -49,8 +46,6 @@ BiocManager::install(c("phyloseq", "MicrobiomeStat", "ANCOMBC",
 | phyloseq | ≥ 1.44 | Data container |
 | LinDA | ≥ 1.0 | LinDA DA test |
 | ANCOMBC | ≥ 2.2 | ANCOMBC2 DA test |
-| edgeR | ≥ 3.40 | Negative-binomial GLM |
-| metagenomeSeq | ≥ 1.40 | Zero-inflated log-normal |
 | lme4 / lmerTest | ≥ 1.1 | CLR-based linear (mixed) models |
 | broom.mixed | ≥ 0.2 | Tidy model output |
 | tidyverse | ≥ 2.0 | Data wrangling |
@@ -78,7 +73,7 @@ ps_list <- list(
 )
 ```
 
-> **Dataset type matters:** datasets  named `"Taxonomy"` receive the full five-method suite (LinDA + ANCOMBC2 + LMM + edgeR + metagenomeSeq). All other names (Functional profiles, TPM normalized) receive LinDA + LMM only.
+> **Dataset type matters:** datasets  named `"Taxonomy"` receive the full three-method suite (LinDA + ANCOMBC2 + LMM). All other names (Functional profiles, TPM normalized) receive LinDA + LMM only.
 
 ---
 
@@ -100,7 +95,7 @@ ps_list <- list(
 results <- run_da_pipeline(
   ps_list        = ps_list,
   variable_col   = "DiseaseStatus",
-  covariates     = c("Age", "bmi_calculated"),
+  covariates     = c("Age"),
   random_effect  = NULL,
   alpha          = 0.05,
   p_adj_method   = "fdr",
@@ -140,8 +135,6 @@ results <- run_da_pipeline(
 | LinDA | Relative abundance (`Taxonomy` dataset only) | Proportion normalisation before LinDA |
 | ANCOMBC2 | Internal (bias-correction) | Handles compositional bias natively |
 | LM / LMM | CLR (centred log-ratio) after pseudo-count | Standard compositional approach |
-| edgeR | TMM normalisation | Negative-binomial dispersion estimated per dataset |
-| metagenomeSeq | Cumulative-sum scaling (CSS) | Quantile-based normalisation |
 
 ---
 
@@ -166,7 +159,7 @@ results <- run_da_pipeline(
 | `pval` | numeric | Nominal p-value |
 | `padj` | numeric | Adjusted p-value (method specified by `p_adj_method`) |
 | `diff_robust` | logical / NA | ANCOMBC2 robustness flag; `NA` for methods that do not provide it |
-| `method` | character | One of `LinDA`, `ANCOMBC2`, `LMM`, `edgeR`, `metagenomeSeq` |
+| `method` | character | One of `LinDA`, `ANCOMBC2`, `LMM` |
 | `dataset` | character | Dataset name as provided in `ps_list` |
 
 ### Consensus table schema
@@ -205,10 +198,10 @@ results <- run_da_pipeline(
 
 ## Overview
 
-This script investigates the association between gut *Sutterellaceae* abundance (mOTU `meta_mOTU_v3_12389`) and breast cancer relapse using two complementary analytical frameworks:
+This script investigates the association between gut *Sutterellaceae* species mOTU `meta_mOTU_v3_12389` abundance and breast cancer relapse using two complementary analytical frameworks:
 
 1. **Logistic regression** — odds ratios (OR) for relapse, using both binary (presence/absence) and continuous (CLR-transformed) abundance.
-2. **Survival analysis** — Cox proportional hazards models and a Kaplan–Meier curve for recurrence-free survival stratified by *Sutterellaceae* presence.
+2. **Survival analysis** — Cox proportional hazards models and a Kaplan–Meier curve for recurrence-free survival stratified by *Sutterellaceae* species mOTU `meta_mOTU_v3_12389` presence.
 
 ---
 
